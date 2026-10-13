@@ -2,7 +2,7 @@
 
 ## Report a vulnerability
 
-Report security problems privately to J.C. Vaught at `jvaught@sc.edu`. Include the affected revision, operating system, reproducible steps, expected impact, and a minimal sanitized configuration. Do not send real passwords, private keys, institutional data, or unnecessary infrastructure details. Ordinary bugs without security-sensitive details can use the repository's public issue tracker.
+Report security problems through [private vulnerability reporting](https://github.com/j-vaught/mownt/security/advisories/new), or contact J.C. Vaught at `jvaught@sc.edu`. Include the affected revision, operating system, reproducible steps, expected impact, and a minimal sanitized configuration. Do not send real passwords, private keys, institutional data, or unnecessary infrastructure details. Ordinary bugs without security-sensitive details can use the repository's public issue tracker.
 
 ## Supported version
 
