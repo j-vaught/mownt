@@ -62,9 +62,11 @@ while [ "$#" -gt 0 ]; do
 done
 [ "$FORCE" -eq 0 ] || [ "$ACTION" = down ] || fail_config '--force is only valid with down'
 [ "$(id -u)" -ne 0 ] || fail_config 'run as your normal account, without elevated privileges'
-[ -n "$HOME" ] && [ "${HOME#/}" != "$HOME" ] && [ "$HOME" != / ] || fail_config 'HOME must be an absolute user directory'
+if [ -z "$HOME" ] || [ "${HOME#/}" = "$HOME" ] || [ "$HOME" = / ]; then
+    fail_config 'HOME must be an absolute user directory'
+fi
 case "$HOME" in *[!A-Za-z0-9_./-]*) fail_config 'HOME contains unsupported characters (spaces are not supported)' ;; esac
-[ -d "$HOME" ] && [ ! -L "$HOME" ] || fail_config 'HOME must be a real directory'
+if [ ! -d "$HOME" ] || [ -L "$HOME" ]; then fail_config 'HOME must be a real directory'; fi
 SYSTEM=$(uname -s)
 case "$SYSTEM" in Darwin|Linux) ;; *) fail_config "unsupported operating system: $SYSTEM" ;; esac
 metadata() {
@@ -75,7 +77,9 @@ check_private() {
     [ ! -L "$path" ] || fail_config "symlinks are not allowed: $path"
     data=$(metadata "$path" 2>/dev/null) || fail_config "cannot inspect: $path"
     read -r owner mode <<< "$data"
-    [ "$owner" = "$(id -u)" ] && [ "$mode" = "$expected" ] || fail_config "$path must be owned by you with mode $expected"
+    if [ "$owner" != "$(id -u)" ] || [ "$mode" != "$expected" ]; then
+        fail_config "$path must be owned by you with mode $expected"
+    fi
 }
 [ -f "$CONFIG" ] || fail_config "configuration missing: $CONFIG (see config/mounts.example.tsv)"
 CONFIG_DIR=$(dirname -- "$CONFIG")
@@ -86,10 +90,12 @@ case "/$CONFIG/" in */../*|*/./*) fail_config 'dot components in configuration p
 cursor=$HOME; remainder=${CONFIG_DIR#"$HOME"/}
 [ "$CONFIG_DIR" != "$HOME" ] || remainder=
 while :; do
-    [ -d "$cursor" ] && [ ! -L "$cursor" ] || fail_config "unsafe configuration ancestor: $cursor"
+    if [ ! -d "$cursor" ] || [ -L "$cursor" ]; then fail_config "unsafe configuration ancestor: $cursor"; fi
     data=$(metadata "$cursor" 2>/dev/null) || fail_config "cannot inspect: $cursor"
     read -r owner mode <<< "$data"
-    [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 8#022))" -eq 0 ] || fail_config "unsafe configuration ancestor ownership/permissions: $cursor"
+    if [ "$owner" != "$(id -u)" ] || [ "$((8#$mode & 8#022))" -ne 0 ]; then
+        fail_config "unsafe configuration ancestor ownership/permissions: $cursor"
+    fi
     [ -n "$remainder" ] || break
     component=${remainder%%/*}
     if [ "$remainder" = "$component" ]; then remainder=; else remainder=${remainder#*/}; fi
@@ -195,7 +201,9 @@ check_local_path() {
             [ -d "$cursor" ] || { err "not a directory: $cursor"; return 1; }
             data=$(metadata "$cursor" 2>/dev/null) || return 1
             read -r owner mode <<< "$data"
-            [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 8#022))" -eq 0 ] || { err "unsafe directory ownership/permissions: $cursor"; return 1; }
+            if [ "$owner" != "$(id -u)" ] || [ "$((8#$mode & 8#022))" -ne 0 ]; then
+                err "unsafe directory ownership/permissions: $cursor"; return 1
+            fi
         fi
         [ -n "$remainder" ] || break
         component=${remainder%%/*}

@@ -36,7 +36,9 @@ check_path() {
             [ -d "$cursor" ] || { error "not a directory: $cursor"; return 1; }
             data=$(metadata "$cursor" 2>/dev/null) || return 1
             read -r owner mode <<< "$data"
-            [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 8#022))" -eq 0 ] || { error "unsafe directory ownership/permissions: $cursor"; return 1; }
+            if [ "$owner" != "$(id -u)" ] || [ "$((8#$mode & 8#022))" -ne 0 ]; then
+                error "unsafe directory ownership/permissions: $cursor"; return 1
+            fi
         fi
         [ -n "$remainder" ] || break
         component=${remainder%%/*}
@@ -51,14 +53,18 @@ check_target() {
         [ -f "$path" ] || { error "not a regular file: $path"; return 1; }
         data=$(metadata "$path" 2>/dev/null) || return 1
         read -r owner mode <<< "$data"
-        [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 8#022))" -eq 0 ] || { error "unsafe target ownership/permissions: $path"; return 1; }
+        if [ "$owner" != "$(id -u)" ] || [ "$((8#$mode & 8#022))" -ne 0 ]; then
+            error "unsafe target ownership/permissions: $path"; return 1
+        fi
         [ "$FORCE" -eq 1 ] || { error "already exists: $path (inspect it, then use --force to replace)"; return 1; }
     fi
 }
 # Validate every destination before changing any files.
 check_path "$PREFIX/bin" && check_path "$PREFIX/share/mownt" || exit 1
 check_target "$PREFIX/bin/mownt" && check_target "$PREFIX/share/mownt/mounts.example.tsv" || exit 1
-[ -f "$SOURCE_DIR/bin/mownt" ] && [ ! -L "$SOURCE_DIR/bin/mownt" ] && [ -f "$SOURCE_DIR/config/mounts.example.tsv" ] && [ ! -L "$SOURCE_DIR/config/mounts.example.tsv" ] || { error 'release source files are missing or symlinked'; exit 1; }
+if [ ! -f "$SOURCE_DIR/bin/mownt" ] || [ -L "$SOURCE_DIR/bin/mownt" ] || [ ! -f "$SOURCE_DIR/config/mounts.example.tsv" ] || [ -L "$SOURCE_DIR/config/mounts.example.tsv" ]; then
+    error 'release source files are missing or symlinked'; exit 1
+fi
 if [ "$DRY_RUN" -eq 1 ]; then
     printf 'Would install %s to %s\n' "$SOURCE_DIR/bin/mownt" "$PREFIX/bin/mownt"
     printf 'Would install example configuration to %s\n' "$PREFIX/share/mownt/mounts.example.tsv"
