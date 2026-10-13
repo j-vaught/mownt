@@ -66,7 +66,7 @@ reset() {
 }
 rejected() {
     run 1 "$SOURCE" "$DEST"
-    [ ! -e "$DEST/mounts.tsv" ] && [ ! -e "$DEST/automation.conf" ] || fail 'rejected source left configuration files'
+    if [ -e "$DEST/mounts.tsv" ] || [ -e "$DEST/automation.conf" ]; then fail 'rejected source left configuration files'; fi
     [ ! -e "$DEST/.import.lock" ] || fail 'rejected source left its lock'
 }
 mode() {
@@ -254,7 +254,7 @@ chmod 700 "$DEST"
 mkdir "$DEST/.import.lock"
 run 1 "$SOURCE" "$DEST"
 [ -d "$DEST/.import.lock" ] || fail 'existing import lock was removed'
-[ ! -e "$DEST/mounts.tsv" ] && [ ! -e "$DEST/automation.conf" ] || fail 'concurrent import produced output'
+if [ -e "$DEST/mounts.tsv" ] || [ -e "$DEST/automation.conf" ]; then fail 'concurrent import produced output'; fi
 pass 'existing import lock prevents concurrent writes'
 
 printf 'All %s legacy import checks passed.\n' "$COUNT"

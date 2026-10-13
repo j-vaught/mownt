@@ -1,70 +1,54 @@
-# Optional relay setup
+# Share relays and automatic setup
 
-A relay makes a network-restricted share visible through a server that you can reach over SSH. `mownt` mounts that server's prepared directory through SFTP. The relay is therefore trusted with the account's data and any credentials it needs for the upstream share. Obtain the server owner's approval and use an account limited to the necessary share.
+A relay reaches the SMB share from its own network and exposes it to your computer through SSHFS. Configure approved SSH aliases and the local SMB remote once. `mownt` then prepares the selected hosts, starts their share mount, and tries them in priority order.
 
-## Establish network access
+## One-time inputs
 
-Use the network route approved by the server administrator. For Tailscale, install the official client using the [macOS guide](https://tailscale.com/docs/install/mac) or the [Linux package instructions](https://tailscale.com/docs/install/linux). Enroll the device yourself and restrict access through the tailnet's access policy. `mownt` does not start, authenticate, or change Tailscale.
+Create the local rclone SMB remote through `rclone config`, then set its name and share in `automation.conf`. The default remote is `perception` and the default share placeholder is `share`. Replace the share placeholder with the real value. Set the `perception` row's aliases to your trusted relay hosts and its remote path to the directory to manage, such as `~/mnt/share`.
 
-Regular SSH can run over a Tailscale address without enabling Tailscale's separate SSH server feature. Configure your alias's `HostName` to the approved address or DNS name and verify its SSH host key as usual. Follow the [SSH-over-Tailscale guide](https://tailscale.com/docs/reference/ssh-over-tailscale) for that arrangement. Enabling Tailscale SSH instead requires its own server and policy setup; do not enable it solely to use this tool.
+The relay accounts need SSH, SFTP, Bash, and working user-level FUSE mounts. The helper uses `curl`, `unzip`, `sha256sum`, `timeout`, `mountpoint`, and `fusermount3` or `fusermount`. These standard prerequisites can be installed once through the relay's supported package manager. For Debian or Ubuntu, the administrator's package command is `sudo apt install bash openssh-server fuse3 curl unzip coreutils util-linux`. Fedora uses `sudo dnf install bash openssh-server fuse3 curl unzip coreutils util-linux`.
 
-Relay checks run with SSH `BatchMode=yes` and connection sharing disabled. Configure approved noninteractive authentication through an enrolled key, agent, or certificate. A password prompt, multifactor prompt, or an already-open SSH master cannot satisfy this check. Do not weaken an institution's authentication policy to accommodate a relay; use an approved endpoint instead.
+After those operating-system prerequisites are available, setup runs as the remote account without system-package installation or remote administrative privileges. If FUSE is disabled by a managed server's policy, its administrator must enable an approved user-mount arrangement.
 
-For the passphrase-protected key in [setup](setup.md), load it into your local session's SSH agent before mounting. If no agent is available, start the agent provided by your operating system or desktop session. Enter the passphrase at its prompt, then verify a noninteractive connection to every relay.
+Configured relay aliases are trusted destinations for the selected SMB credential. The command sends that one named block over authenticated SSH and stores it in private relay files. This is the intended setup for mounting the same share from several hosts. Keep the alias list restricted to accounts and machines approved to hold that credential.
 
-```sh
-ssh-add "$HOME/.ssh/id_ed25519_mownt"
-ssh-add -l
-ssh -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=yes relay-a true
-ssh -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=yes relay-b true
-```
+## Prepare and use the relays
 
-## Prepare the backing share on each relay
-
-The following optional example uses rclone on a Linux relay. Install its approved package and FUSE runtime through the server's administrator or the [official installation instructions](https://rclone.org/install/). Verify downloaded artifacts using that release's published verification procedure. The example assumes the relay can already reach the SMB server and that the administrator permits user-level FUSE mounts.
-
-Log into the relay, prepare private directories, and configure a remote named `research-share` interactively. Choose the SMB backend and enter the approved hostname, account, domain, and authentication details. The [SMB backend reference](https://rclone.org/smb/) also describes Kerberos configuration where your institution requires it.
+With the private settings in place, run setup once to check the hosts immediately.
 
 ```sh
-umask 077
-mkdir -p "$HOME/.config/rclone" "$HOME/.cache/rclone-research" "$HOME/mnt/share"
-chmod 700 "$HOME/.config/rclone" "$HOME/.cache/rclone-research" "$HOME/mnt/share"
-rclone config
-rclone config file
+mownt setup
+mownt -p
 ```
 
-Confirm the reported configuration location is private and apply mode `600` to that actual file. With the default path, use the following command.
+Ordinary `mownt` performs the same preparation when components are missing, so subsequent computers need no separate manual relay installation. Missing rclone is downloaded as a pinned official Linux release and checked against the expected SHA256 digest before installation. The pinned version and digests are part of the reviewed command, rather than taken from a moving latest-release URL. The upstream [downloads](https://rclone.org/downloads/) and [release verification guide](https://rclone.org/release_signing/) explain the official artifacts.
+
+The managed helper creates and mounts the backing share, checks its responsiveness, and repairs its stale mount when necessary. The laptop verifies that backing path before opening SSHFS. If a relay cannot connect or mount the share, the next configured alias is tried. A home-relative path resolves beneath each remote account's own home, so those accounts may have different absolute home directories.
+
+## Authentication and network access
+
+SSH masters share the authenticated connection among provisioning, share checks, and filesystem mounts. A relay can therefore use the same password or multifactor session rather than requiring a separate login for each operation. Protect the configured control-socket directory with mode `700`. The [SSH control-socket documentation](https://man.openbsd.org/ssh_config#ControlPath) describes its role.
+
+If the relays are reached through Tailscale, install and enroll its client once using the [macOS](https://tailscale.com/docs/install/mac) or [Linux](https://tailscale.com/docs/install/linux) instructions. `TAILSCALE=auto` lets `mownt` bring it up when necessary. Its account and network access policy remain your existing Tailscale configuration. Regular SSH over that route does not require enabling Tailscale's separate SSH server feature.
+
+When every relay fails, `DIRECT_FALLBACK=yes` lets local rclone try the same SMB share directly. This succeeds when the computer has a route to the SMB server, such as the campus network or an approved VPN. Local rclone and the appropriate filesystem support must be installed once as described in [setup](setup.md).
+
+The macOS fallback uses a loopback NFS server, whose access model trusts other local accounts. On a shared computer with untrusted users, set `DIRECT_FALLBACK=no` and retain the relay route. See the [security policy](../SECURITY.md) for that boundary.
+
+## Update the share credential
+
+After changing the actual account password through its owning institution, update the saved client credential.
 
 ```sh
-chmod 600 "$HOME/.config/rclone/rclone.conf"
-rclone lsd research-share:
+mownt passwd
 ```
 
-Keep the file out of this repository. A password produced by `rclone obscure` is reversible obfuscation, not protection against someone who can read the file. The [obscure reference](https://rclone.org/commands/rclone_obscure/) explains this distinction. Rclone supports configuration encryption; follow its [configuration documentation](https://rclone.org/docs/#configuration-encryption) if required, and provide the encryption password interactively. Do not put either kind of password on a command line or copy a credential block between relays automatically.
+The command reads the replacement at hidden prompts, updates the selected local block, sends it to reachable configured relays, and refreshes the share mounts. An unreachable relay receives the current block on a later setup or mount run. Other rclone remote blocks are kept separate from this synchronization.
 
-For the first test, replace `SHARE_NAME` with the approved share name and keep the mount read-only. Run in a dedicated terminal so errors remain visible.
+Rclone's obscured password representation is reversible and must be treated as a secret, as explained in the [obscure reference](https://rclone.org/commands/rclone_obscure/). Keep local and remote configuration private. The SMB server, the relay account, and the relay's administrator are within the trust boundary for that share.
 
-```sh
-rclone mount research-share:SHARE_NAME "$HOME/mnt/share" \
-    --read-only \
-    --cache-dir "$HOME/.cache/rclone-research" \
-    --vfs-cache-mode full \
-    --vfs-cache-max-size 20G
-```
+## Service and cache behavior
 
-Use a second relay session to verify that the path is actually a mounted filesystem and that expected contents are present.
+The helper's cache supports normal file editing through rclone's virtual filesystem. Its cache at `~/.cache/mownt/rclone` stays private to the relay account. Recovery waits for an older rclone process using that cache to exit before restarting it. If the process remains busy, that relay attempt fails so another configured relay can be tried. Close client files before deliberately restarting a relay or changing its backing mount, and preserve its cache while uploads are pending. The [rclone mount documentation](https://rclone.org/commands/rclone_mount/) describes cache retries and shutdown behavior.
 
-```sh
-mountpoint -q "$HOME/mnt/share"
-ls "$HOME/mnt/share"
-```
-
-Point the laptop's `perception` row at `~/mnt/share`, as in the template, and use mode `ro`. This group requires the relay's `mountpoint` utility, because the command checks that path before mounting it. The relative suffix resolves beneath each relay account's own home, allowing different absolute home directories. Its shell and SFTP homes must agree. Prepare and verify each additional relay independently before adding it to the comma-separated alias list. Every relay must expose the same upstream directory at that corresponding path with equivalent permissions.
-
-## Preserve the backing-mount boundary
-
-Before selecting a `perception` relay, `mownt` checks that its resolved backing path is a mountpoint and rejects failures. If that backing mount disappears afterward, its underlying directory can still be exposed through an existing SSHFS connection. A healthy laptop mount therefore does not prove that the upstream share remains mounted. Before writing, verify the backing filesystem on the relay and its expected contents. Keep the local row read-only until that check succeeds. An administrator can provide a guarded SFTP service or another supervised arrangement that refuses access when the backing mount is absent.
-
-For write access, the relay operator must deliberately remove `--read-only` and the laptop configuration must use `rw`. Protect the cache directory and its disk, because cached file contents may be sensitive. Rclone caches can exceed their configured size while files remain open, and writes may still be waiting for upload after an application closes a file. Its [mount and cache documentation](https://rclone.org/commands/rclone_mount/) describes durability, retry, and shutdown behavior.
-
-Close client files, unmount the laptop normally, and verify pending uploads on the relay before shutting down the backing mount. Do not delete its cache to fix an upload problem. For unattended operation, ask the relay administrator to supervise the mount using the host's supported service manager, with private logs and credentials, upstream connectivity checks, and a shutdown process that preserves pending writes.
+Automatic recovery restores availability; it does not prove that interrupted writes reached the server. A backing mount can also disappear after the laptop's initial check. After a network or server failure, verify important files through a separate session before resuming interrupted work. Use independent backups for important data.

@@ -1,48 +1,53 @@
 # Troubleshooting
 
-Start with `type -a mownt`, `mownt doctor`, `mownt --dry-run`, and `mownt status`. This establishes which executable is running, whether the private configuration is valid, and what operation is planned. Do not post raw configuration, command previews, SSH logs, or mount listings publicly without removing account names, addresses, and sensitive paths.
+Start with `type -a mownt`, `mownt doctor`, `mownt --dry-run`, and `mownt status`. These identify the executable, validate local files, preview the operation, and report mount health. Remove accounts, addresses, credentials, and sensitive paths before sharing diagnostic output.
 
-## The command is missing or an old version runs
+## An old command runs
 
-Confirm that the installer completed and that its prefix's `bin` directory is on `PATH`. Open a new shell after changing the startup file. An alias, shell function, or earlier executable may take precedence over `~/.local/bin/mownt`; `type -a mownt` reveals that ordering.
+Check `type -a mownt` for an alias, function, or earlier executable. Put the selected installation prefix's `bin` directory on `PATH` and open a new shell. `mownt --version` identifies the installed release.
 
 ## Configuration is refused
 
-The config file needs exactly six literal tab-separated fields per data row, a unique label and mountpoint, valid groups and modes, and permitted paths. Use `cat -t` locally to make tabs visible as `^I`. Check the path selected by `--config` or `XDG_CONFIG_HOME`, then correct its owner and permissions. The immediate parent must be owned by you with mode `700` and the file with mode `600`. Symlinked configuration and mountpoint components are refused.
+The mount table requires six literal tab-separated fields per data row. Use `cat -t` locally to display tabs as `^I`. `automation.conf` uses literal `KEY=value` lines without shell quoting or expansion. Both files must be private and owned by you.
 
 ```sh
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mownt"
-ls -ld "$config_dir" "$config_dir/mounts.tsv"
 chmod 700 "$config_dir"
-chmod 600 "$config_dir/mounts.tsv"
+chmod 600 "$config_dir/mounts.tsv" "$config_dir/automation.conf"
 mownt doctor
 ```
 
-Do not use `sudo mownt` to bypass a permission error. Create a normal-user configuration and mountpoint instead. Whitespace in local home or mount paths is outside the supported configuration format.
+Configuration and mountpoint ancestors cannot be symlinked or writable by other users. Unsupported whitespace or path traversal is refused. Use normal dedicated mountpoint directories rather than running the command with administrative privileges.
 
-## Host-key checking fails
+## A host key is unknown or changed
 
-An unknown key requires the verification procedure in [setup](setup.md). A changed key requires independent confirmation of the server's current fingerprint and the reason for the change. A host-key warning can indicate interception or the wrong destination. Do not disable checking, blindly remove `known_hosts`, or accept a replacement to make the error disappear. After an administrator confirms a legitimate replacement, update only the affected entry using the institution's approved process.
+Follow the initial verification procedure in [setup](setup.md). Obtain fingerprints through an independent trusted channel. For a changed key, confirm the server and reason for the change with its administrator before updating the affected entry. Do not disable checking or erase `known_hosts` to clear the error.
 
-## Authentication repeats or fails
+## Authentication repeats
 
-Test the same alias with `ssh -o ControlPath=none -o StrictHostKeyChecking=yes ALIAS` and test `sftp` separately. Recheck your account, key enrollment, agent, network access, and the server's multifactor policy. `mownt` disables connection sharing, so an existing SSH master does not bypass authentication. Multiple mounts may prompt separately. An SFTP-only account can succeed through SSHFS even if it does not permit an interactive shell.
+`mownt` shares the authenticated connection for a host while its SSH master remains valid. A fresh or expired session still requires the server's password or multifactor approval. Use the same alias throughout the mount table and any login helper, and keep the configured control-socket directory private.
 
-Inspect `ssh -G ALIAS` locally to see effective SSH settings. Your SSH configuration is trusted executable configuration and may include a proxy command or a `Match exec` condition. Review included files and remove unwanted local behavior. Do not share the full output publicly without redaction.
+If a trusted `delta-login` helper is configured, confirm it is executable and creates the master's configured control socket. Without a helper, SSH prompts normally. A passphrase-protected key can be loaded into the local SSH agent with `ssh-add "$HOME/.ssh/id_ed25519_mownt"`.
 
-## SSH works but SSHFS fails
+Inspect `ssh -G ALIAS` locally to check effective host, user, and control settings. A proxy command or `Match exec` condition remains trusted SSH configuration. Do not post that full output publicly without redaction.
 
-Confirm `sshfs --version` works and that the FUSE runtime is installed and available to your user. On macOS, complete the runtime's operating-system approval and restart steps. On Linux, a container, unavailable `/dev/fuse`, or restricted user-mount policy may require administrator assistance. Confirm that the remote server permits SFTP and that your configured directory exists inside its SFTP view.
+## SSH works but the filesystem does not
 
-The command uses SSHFS `default_permissions` and `idmap=user`. These apply local permission checks and map the authenticated remote user's identifiers. Supplementary shared-group identifiers can still differ between machines, so an operation may work through SFTP but fail on a locally mounted shared directory. Ask the server administrator to resolve the permission model rather than disabling local checks or granting broad access.
+Confirm `sshfs --version` runs and that FUSE is available to your account. Complete macOS runtime approval and restart requirements. On Linux, a container or restricted `/dev/fuse` may need the host administrator's supported configuration. Verify the directory through `sftp ALIAS`; its view can differ from the login shell.
 
-## A mountpoint is nonempty
+The SFTP server enforces the authenticated account's permissions, including access through remote project groups. SSHFS maps the account's identifiers with `idmap=user` and limits local access to the mounting user. The command omits `default_permissions` and `allow_other`, preserving remote group access without exposing the mount to other local users. See the [SSHFS permission guidance](https://github.com/libfuse/sshfs/blob/master/sshfs.rst).
 
-`mownt` refuses to hide local files under a new mount. Confirm the directory is unmounted, inspect its contents, and move any real local data to a separate safe location. Use a fresh empty dedicated directory when possible. Do not delete files just to satisfy this check, and never run recursive removal against a mountpoint.
+## The share relay fails
+
+Run `mownt setup` to repeat provisioning and credential synchronization, then `mownt -p`. Check the selected SMB remote and share names in `automation.conf`, the local private rclone configuration, relay SSH access, FUSE availability, and upstream network reachability. An installed Tailscale client must have been enrolled once before automatic startup can connect it.
+
+A checksum failure stops a relay binary installation. Retry after checking the official release and the reviewed pin; do not bypass the check. If a host is unavailable, the next configured relay is tried. If all fail, direct fallback needs local rclone and a route to the SMB server. A home-relative relay path requires matching shell and SFTP home views.
+
+After an institutional password change, run `mownt passwd` to update the saved credential and refresh reachable relays. Offline relays synchronize on a later run. This command changes saved clients rather than the actual server password.
 
 ## A mount is stale or busy
 
-Save and close files, stop jobs accessing the mount, and move terminal working directories outside it. Check the network and remote server. Then run a normal unmount of the affected group and remount deliberately.
+`mownt` automatically repairs stale expected mounts, first normally and then with configured force escalation. Close applications and leave mountpoint working directories before a planned unmount. A clean shutdown is still best for ongoing writes.
 
 ```sh
 cd "$HOME"
@@ -50,16 +55,10 @@ mownt down -d
 mownt -d
 ```
 
-If ordinary unmounting still fails, investigate which local applications hold files open using your operating system's tools. `lsof` may help with a busy mount but can itself wait on a broken filesystem. Force is an explicit last step after assessing pending writes.
+A foreign mount is refused rather than recovered. Inspect its source and unmount it through the application that owns it. An unmounted nonempty directory is also refused; preserve its local files in another location or use a fresh empty mountpoint.
 
-```sh
-mownt down --force -d
-```
+Force can interrupt writes. Linux lazy detachment does not establish that the filesystem process exited or buffered data arrived. After an interrupted connection, verify important files through another session before resuming work. Preserve relay caches while uploads remain pending.
 
-Forced unmounting can interrupt open files and pending writes. On Linux it requests lazy detachment, which does not establish that the filesystem process exited or its writes finished. Restore connectivity and verify important files through a separate session before resuming work.
+## Recovery reaches an empty directory
 
-## A relay looks empty or the wrong relay is selected
-
-Log into the selected relay and confirm that its backing share is mounted at the configured remote path, then inspect expected contents. A relative path is resolved beneath that relay account's home directory, and the shell and SFTP views must agree. The connection-time `mountpoint` check rejects a missing backing mount but cannot prevent it from disappearing during the session. Stop laptop clients before restarting or unmounting a relay share. Verify the account and backing configuration independently on every failover host. See [relay setup](relay.md) before enabling writes.
-
-The alias list is mount-time failover, not replication. An established mount does not switch an open file to another relay. If every relay fails, investigate the individual authentication, network, backing mount, and SFTP errors. The command does not silently switch to direct SMB or NFS access.
+A relay backing share is checked before use, but can disappear during a session. Stop clients, let `mownt setup` repair the relay, and run `mownt -p` again. Inspect expected content before restarting interrupted jobs. Ordered failover chooses a new mount; it does not migrate open files or replicate data between servers.

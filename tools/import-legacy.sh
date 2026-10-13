@@ -10,7 +10,7 @@ if [ "$#" -ne 2 ]; then
 fi
 SOURCE=$1
 DEST=${2%/}
-[ -f "$SOURCE" ] && [ -r "$SOURCE" ] || die 'old script must be a readable file'
+if [ ! -f "$SOURCE" ] || [ ! -r "$SOURCE" ]; then die 'old script must be a readable file'; fi
 [ "$(id -u)" -ne 0 ] || die 'run as your normal account'
 case "$HOME" in /*) ;; *) die 'HOME must be absolute' ;; esac
 case "$DEST" in "$HOME"/*) ;; *) die 'output directory must be below HOME' ;; esac

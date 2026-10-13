@@ -2,28 +2,38 @@
 
 ## Report a vulnerability
 
-Report security problems through [private vulnerability reporting](https://github.com/j-vaught/mownt/security/advisories/new), or contact J.C. Vaught at `jvaught@sc.edu`. Include the affected revision, operating system, reproducible steps, expected impact, and a minimal sanitized configuration. Do not send real passwords, private keys, institutional data, or unnecessary infrastructure details. Ordinary bugs without security-sensitive details can use the repository's public issue tracker.
+Report security problems privately to J.C. Vaught at `jvaught@sc.edu`. Include the affected revision, operating system, reproducible steps, impact, and a minimal sanitized configuration. Keep real passwords, private keys, institutional data, and unnecessary infrastructure details out of reports. Ordinary bugs without sensitive details can use the public issue tracker.
 
 ## Supported version
 
-Security fixes target the latest release and current `main` branch. Update from a reviewed revision and reinstall the command when a fix affects installed files. No response-time or patch-time commitment is implied.
+Security fixes target the latest release and current `main` branch. Review updates and reinstall when installed files change. No response-time or patch-time commitment is implied.
 
-## Trust model
+## Automated operations and trust
 
-`mownt` runs with your account's privileges. It trusts the operating system, installed SSH and SSHFS/FUSE binaries, your private SSH configuration, your selected servers, and your account's own files and processes. Remote servers and relays can read or modify the data their access permits. A read-only laptop mount limits writes from that mount; it does not prevent a server or another authorized client from changing the underlying data.
+`mownt` runs with your account's privileges and automates your configured SSH sessions, network startup, mounts, and approved relay accounts. It trusts the operating system, installed tools, SSH configuration, local login helper, selected servers, and your account's own processes. The mount table and automation settings are strict data files rather than sourced shell code.
 
-The TSV configuration is parsed as data, with restricted fields and paths, rather than sourced or evaluated. It must be private and user-owned. Mountpoints remain below your home directory and reject symlink components. Existing nonempty directories are not covered by a new mount. These checks reduce accidental misuse and hostile configuration risks; they do not defend against another process already running as your user or an administrator.
+The relay aliases in your private configuration are authorized destinations for the selected SMB credential. Provisioning synchronizes only that named rclone block over authenticated SSH into private files, so those relay accounts can mount the share for you. Relay administrators and anyone who compromises those accounts can access that credential and its permitted data. Configure approved trusted hosts and use a share account limited to the required access.
 
-SSH host-key verification is strict. Verify initial fingerprints through an independent trusted channel using [setup](docs/setup.md), and investigate key changes. The command disables connection sharing and forwarding on its connections. Your SSH configuration can still direct traffic through a proxy or execute locally configured commands, so its contents and includes must remain trusted. `mownt` neither supplies nor stores authentication secrets.
+The managed password action reads secrets at hidden prompts and keeps them out of command arguments, source files, dry-run output, and normal logs. An optional private login helper supplies its own trusted local credential mechanism. Rclone's obscured password values remain recoverable and are treated as secrets. `passwd` updates saved client credentials and relays; it does not rotate the actual server account password.
 
-## Relay and data safety
+## Connections and provisioning
 
-Relay setup, dependency installation, VPN enrollment, credential storage, and service supervision are manual administrative actions. The command does not download remote binaries, replicate credentials, rotate account passwords, kill unrelated processes, or automatically force-unmount a filesystem. The removed legacy password action only updated saved client credentials, rather than the actual server password.
+SSH host-key verification remains strict. Verify first-use fingerprints through an independent trusted channel using [setup](docs/setup.md). Shared SSH masters reuse authenticated sessions so mounts and provisioning can use one host login, including multifactor approval. Control sockets must be private, user-owned, and protected from replacement. Agent and port forwarding are disabled for managed connections.
 
-Each `perception` candidate must pass a connection-time backing-mount check at its resolved remote path. Relative paths resolve beneath the relay account's home, whose shell and SFTP views must agree. This check requires the relay's `mountpoint` command and fails closed when the check fails. The backing share can still disappear after that check, so stop clients before changing relay mounts and verify the backing filesystem before writes. Relays need private configuration and cache directories, least-privilege upstream accounts, and approved access rules. Rclone's obscured password values remain recoverable and must be treated as secrets.
+An optional trusted `delta-login` executable can establish the configured master using an existing local password or credential-store workflow. That helper and your SSH configuration are executable local configuration and belong within your trust boundary. The repository does not contain personal helpers, passwords, private keys, or institutional host settings.
 
-Normal unmounting is the default. Explicit force can interrupt work or discard pending writes. On Linux it requests lazy detachment, which does not establish that the filesystem process exited or data was flushed. SSHFS and any backing cache have their own availability and durability behavior. Close files, resolve upload failures, and verify important data before disconnecting or shutting down a relay. Use independent backups.
+Missing relay rclone binaries are installed from a pinned official artifact only after the expected SHA256 checksum matches. This verifies the downloaded bytes against the reviewed pin. It does not replace trust in the upstream release and the repository revision that supplies the digest. Existing external dependencies remain the responsibility of their supported update channels.
+
+## Filesystem recovery and data
+
+Configuration and mount paths are constrained beneath your home directory with ownership, permission, symlink, and traversal checks. A nonempty unmounted directory is not covered. The command verifies the expected filesystem source before automatic stale recovery or unmounting and does not broadly kill unrelated processes.
+
+Automatic local recovery first attempts a normal unmount and can escalate to force or lazy detachment according to `AUTO_FORCE`. Relay backing-share recovery separately attempts normal unmounting and then lazy detachment when necessary. This restores the original one-command recovery behavior. It can interrupt open files or pending writes. Linux lazy detachment does not establish that a filesystem process exited or that its cache was flushed.
+
+Relay backing mounts are checked before use and repaired by the managed helper. The backing share can disappear after a check, and cached writes can outlive the client operation. Close files before planned disconnection, preserve caches with pending uploads, and verify important data after interrupted operations. Direct fallback uses the same configured SMB share through local rclone. Use independent backups.
+
+On macOS, direct fallback uses rclone's local NFS server bound to loopback. That server has no per-user client authentication, so other local accounts or processes are within its trust boundary. On a shared computer with untrusted local users, set `DIRECT_FALLBACK=no` and use the relay path. The [rclone NFS reference](https://rclone.org/commands/rclone_serve_nfs/) describes this access model.
 
 ## Review scope
 
-The repository's automated checks exercise parsing, validation, command construction, installation behavior, and selected failure paths with mocked tools. They do not establish live server access, institution-specific authentication compatibility, kernel filesystem correctness, or end-to-end write durability. Keep SSHFS, FUSE, SSH, and optional relay dependencies updated through supported sources. No security review can establish the absence of vulnerabilities.
+Automated tests use isolated fixtures and mocked filesystem, SSH, network, provisioning, and credential tools. They cover command construction and selected success and failure paths without contacting live accounts. They do not establish institution-specific authentication compatibility, kernel filesystem correctness, live-server durability, or the absence of vulnerabilities. Keep SSH, SSHFS, FUSE, rclone, and network clients updated through supported sources.

@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 mounts.tsv
+automation.conf
 config/*.local.tsv
 *.key
 *.pem

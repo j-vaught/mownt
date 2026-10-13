@@ -1,6 +1,10 @@
-# Migrate an existing personal installation
+# Migrate an existing installation
 
-The public release replaces machine-specific settings with a private mount table and explicit setup. Your current command remains in place until you install over its path. Keep a local backup before making that change, and keep its private contents outside this public repository.
+Version 1.1 restores the original daily workflow. Configure a new computer once, then use the familiar `mownt`, group selectors, status, unmount, setup, and saved-password update commands. SSH authentication is shared across each host's mounts, relays are prepared automatically, and stale mounts are recovered without a separate repair routine.
+
+## Preserve your private setup
+
+Keep a local backup of the existing command before installing over its path. Its server addresses and account paths belong outside this public repository.
 
 ```sh
 umask 077
@@ -10,33 +14,56 @@ cp "$HOME/.local/bin/mownt" "$HOME/.local/share/mownt-backup/mownt-before-public
 chmod 600 "$HOME/.local/share/mownt-backup/mownt-before-public-release"
 ```
 
-If your existing command is elsewhere, substitute its verified path. Finish pending work and unmount using the existing command before installing the release. Follow [setup](setup.md) for the new machine or the new configuration. Do not import or source the old script.
+If your command is elsewhere, substitute its verified path. Finish pending work and unmount before replacing the executable. Use the data-only importer below or follow [setup](setup.md) to create the release's private configuration. Never source the old script to extract its settings.
 
-## Map your drives
+For the original script layout, the importer reads its known literal settings and writes private release configuration. Run it before replacing the old command. The destination must be beneath your home directory and contain no existing configuration files.
 
-Copy the meaning of your old settings into the template, with your own accounts and paths. The following mapping preserves the original group layout while leaving institution-specific values private.
+```sh
+./tools/import-legacy.sh "$HOME/.local/bin/mownt" "$HOME/.config/mownt"
+./install.sh --force
+mownt doctor
+mownt
+```
 
-| Group | Typical label | Remote directory to establish through SFTP | Local mountpoint |
+The importer does not execute the old script, contact servers, or copy credentials. It preserves recognized drive paths, SSH aliases, SMB remote and share names, and the local rclone configuration path. Inspect the resulting files before the first run. Unsupported script layouts are refused instead of guessed.
+
+If you already created version 1.0 settings, import into a separate private directory and compare the result before deliberately replacing your active files.
+
+```sh
+./tools/import-legacy.sh "$HOME/.local/share/mownt-backup/mownt-before-public-release" "$HOME/.config/mownt-import"
+```
+
+## Map the original drives
+
+The public template keeps the original local folder layout in read/write mode. Replace its remote paths and aliases with your own private values.
+
+| Group | Typical label | Remote directory | Local mountpoint |
 | --- | --- | --- | --- |
-| `theia` | `theia-home` | Your account's home directory. | `~/mnt/theia-home` |
-| `theia` | `theia-work` | Your work directory. | `~/mnt/theia-work` |
-| `delta` | `delta-home` | Your cluster home directory. | `~/mnt/delta-home` |
-| `delta` | `delta-scratch` | Your allocation's scratch directory. | `~/mnt/delta-scratch` |
-| `delta` | `delta-projects` | Your allocation's project directory. | `~/mnt/delta-projects` |
-| `perception` | `perception-share` | The same prepared share, for example `~/mnt/share` relative to each relay account's home. | `~/mnt/perception-share` |
+| `theia` | `theia-home` | Your account's home directory. | `~/theia-home` |
+| `theia` | `theia-work` | Your work directory. | `~/theia-work` |
+| `delta` | `delta-home` | Your cluster home directory. | `~/delta-home` |
+| `delta` | `delta-scratch` | Your allocation's scratch directory. | `~/delta-scratch` |
+| `delta` | `delta-projects` | Your allocation's project directory. | `~/delta-projects` |
+| `perception` | `perception_wang` | The prepared share beneath each relay account's home. | `~/perception_wang` |
 
-You can retain an existing local mountpoint name by setting `local_path` accordingly, provided it passes validation and is empty while unmounted. Configure every selected relay alias locally and verify every host key. Keep `ro` until you have verified the correct contents and relay backing mount.
+The share label is a local name. Keep your current name or change it in your private mount table. A home-relative relay path works across accounts with different absolute home directories when their shell and SFTP views agree.
 
-## Changed behavior
+## Keep the automation
 
-The usual group selectors, default mount-all action, status checks, and unmount action remain. The public release uses strict host-key checking rather than accepting first-seen keys automatically. It does not reuse an SSH master or invoke a password-filling login helper, so multifactor authentication may be requested for each mount.
+Configure the share remote once through local `rclone config`. Select that remote and its share in `automation.conf`. `mownt setup` then installs missing relay tooling, synchronizes that selected credential block over SSH, and installs the managed helper. Ordinary `mownt` also repairs missing pieces as needed and tries relays in order.
 
-Provisioning and password automation have moved out of the command. The former setup flow installed remote tools and copied a credential-bearing configuration to multiple servers. Configure each relay independently using [relay setup](relay.md). The old password action changed stored client credentials; it did not change the actual account password on the SMB server. Rotate the account password through the institution's approved service, then update each authorized client privately.
+If your existing cluster login uses a trusted executable such as `~/.ssh/delta-login`, retain that path in `DELTA_LOGIN`. It remains a local executable and receives the selected SSH alias. Keep its credential retrieval local, such as an operating-system credential store, rather than placing a password in this repository. Without a helper, SSH prompts normally and the authenticated master is reused for the host's directories.
 
-The public release does not enable a VPN, automatically mount a relay's backing share, or perform the former direct SMB/NFS fallback. Establish network access yourself, prepare the relay, and use the configured SSHFS path. It also avoids broad process termination and automatic force-unmount recovery. Explicit `down --force` remains available for a stuck local mount after you assess pending work.
+Tailscale startup, direct share fallback, and automatic stale-mount recovery are available again. Their configuration is described in the [reference](configuration.md). The command retains strict host-key verification, so verify initial host fingerprints through the [setup procedure](setup.md) before the first automated connection.
 
-## Move to another computer
+The `passwd` action updates the saved SMB client credential and distributes it to configured relays. It does not change the underlying account password at the institution. Change that password through the approved account service first, then run `mownt passwd` to synchronize the clients.
 
-Clone this repository and follow setup again. Generate a new private key where allowed and enroll the new computer under the server's policy. Recreate your mount table locally or transfer it through an authenticated private channel, then fix its ownership and modes on the destination. Obtain and verify server host keys through an independent trusted source. Transfer neither plaintext passwords nor private keys through this repository.
+## Upgrade from version 1.0
 
-After verifying the new computer, revoke obsolete device keys and VPN registrations through their respective administrative services when you retire the old one. Keep the backup only as long as it is needed, because old scripts and client configuration can reveal infrastructure details.
+The six-column mount table remains the starting point. Add `automation.conf` and the local rclone share remote, restore your preferred local folder names, and select `rw` for normal write access. Version 1.0's manual relay preparation, repeated multifactor prompts, and explicit stale-repair routine are superseded by the automated workflow.
+
+## Set up another computer
+
+Clone the repository and follow [setup](setup.md). Enroll a fresh SSH key where allowed, verify host keys independently, recreate or privately transfer the mount settings, and enter the share credential through `rclone config`. Keep passwords and private keys outside version control. Once these local prerequisites are in place, run `mownt setup`, then use `mownt` for daily work.
+
+When retiring a computer, revoke its obsolete device keys and VPN registration through their respective administrative services. Remove old local credentials through their owning applications when they are no longer needed.

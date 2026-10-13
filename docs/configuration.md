@@ -1,66 +1,92 @@
 # Configuration and commands
 
-`mownt` reads a data file rather than executing a shell configuration. By default it uses `${XDG_CONFIG_HOME:-$HOME/.config}/mownt/mounts.tsv`. An explicit `--config FILE` selects another file with the same format and permission requirements.
+`mownt` reads a private mount table and optional automation settings. Both are parsed as data. By default they live in `${XDG_CONFIG_HOME:-$HOME/.config}/mownt`. `--config FILE` selects another mount table and uses the `automation.conf` beside that file.
 
-## File format
+## Mount table
 
-Each nonblank, noncomment line contains exactly six fields separated by literal tabs. Comment lines start with `#`. A row describes one mountpoint.
+Each nonblank, noncomment line of `mounts.tsv` contains exactly six fields separated by literal tabs. Comment lines start with `#`. A row describes one filesystem.
 
 | Field | Meaning | Example |
 | --- | --- | --- |
-| `group` | Selection group, `theia`, `delta`, or `perception`. | `theia` |
-| `label` | Unique human-readable mount name. | `theia-home` |
+| `group` | `theia`, `delta`, or `perception`. | `theia` |
+| `label` | Unique mount name. | `theia-home` |
 | `ssh_aliases` | SSH alias or comma-separated aliases in priority order. | `relay-a,relay-b` |
-| `remote_path` | Directory exposed through SFTP on each listed host. | `/home/YOUR_ACCOUNT` |
-| `local_path` | Dedicated mountpoint beneath your local home directory. | `~/mnt/theia-home` |
-| `mode` | `ro` for read-only, or `rw` for read/write. | `ro` |
+| `remote_path` | Directory exposed through SFTP. | `/home/YOUR_ACCOUNT` |
+| `local_path` | Dedicated mountpoint beneath your local home. | `~/theia-home` |
+| `mode` | `rw` for normal access or `ro` for read-only access. | `rw` |
 
-The following shell command writes a single example row with actual tabs into a new private file. Replace its values before use and preserve any existing configuration.
+The template uses read/write mode and the original local folder names. Replace account paths and SSH aliases with your private values, then remove unused rows. Put usernames, ports, keys, and jump-host settings in `~/.ssh/config`.
 
-```sh
-umask 077
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mownt"
-mkdir -p "$config_dir"
-chmod 700 "$config_dir"
-test ! -e "$config_dir/mounts.tsv" && printf 'theia\ttheia-home\ttheia\t/home/YOUR_ACCOUNT\t~/mnt/theia-home\tro\n' > "$config_dir/mounts.tsv"
-chmod 600 "$config_dir/mounts.tsv"
+Labels use letters, digits, underscores, and hyphens, beginning with a letter or digit. SSH aliases additionally allow dots. Paths use a restricted ASCII set of letters, digits, underscores, hyphens, dots, and slashes. Remote paths may be absolute or home-relative, including `~/`. The command normalizes remote `~/suffix` to the SFTP home-relative `suffix`. Local paths must be strictly beneath your home directory, written as an absolute path or with `~/`. Whitespace, executable expressions, traversal through `..`, and symlink components are rejected.
+
+For relays, a home-relative share path resolves beneath each account's home. Their shell and SFTP views must agree. This supports different absolute home directories across hosts. Mountpoints must be unique, unnested, user-owned, and empty before the first mount.
+
+## Automation settings
+
+`automation.conf` contains one literal uppercase `KEY=value` per line. It is not a shell script. Use no shell quotes, command substitutions, or environment expansions. Local path settings accept `~/` as a shorthand for your home directory. The example file provides these defaults.
+
+```ini
+SSH_MASTER=yes
+TAILSCALE=auto
+DELTA_LOGIN=~/.ssh/delta-login
+AUTO_PROVISION=yes
+AUTO_FORCE=yes
+DIRECT_FALLBACK=yes
+SMB_REMOTE=perception
+SMB_SHARE=share
+RCLONE_CONFIG=~/.config/rclone/rclone.conf
 ```
 
-Labels use letters, digits, underscores, and hyphens, beginning with a letter or digit. SSH aliases additionally allow dots. Put usernames, hostnames, ports, keys, and jump-host settings in your private `~/.ssh/config`. Do not put `user@host`, SSH flags, or shell commands in the alias field.
+| Setting | Behavior |
+| --- | --- |
+| `SSH_MASTER=yes` | Establish and reuse a shared authenticated connection for each host. |
+| `TAILSCALE=auto` | Start an installed Tailscale connection when needed. `off` leaves it alone. |
+| `DELTA_LOGIN=~/.ssh/delta-login` | Use this trusted executable for Delta login when available. `none` disables the helper. |
+| `AUTO_PROVISION=yes` | Install or repair the managed relay tooling and synchronize the selected SMB configuration. |
+| `AUTO_FORCE=yes` | Escalate normal client unmount failure to force or lazy detach for the expected local mount. |
+| `DIRECT_FALLBACK=yes` | Try local rclone access when no relay is usable. |
+| `SMB_REMOTE=perception` | Select the named local rclone SMB configuration block. |
+| `SMB_SHARE=share` | Select the share inside that SMB remote. |
+| `RCLONE_CONFIG=~/.config/rclone/rclone.conf` | Read and update the selected credential in this private file. |
 
-Paths accept a restricted ASCII set of letters, digits, underscores, hyphens, dots, and slashes. A remote path may be absolute, relative to the remote home, or begin with `~/`. The command normalizes remote `~/suffix` to the SFTP home-relative `suffix`. A local path must be an absolute path strictly beneath your home directory or begin with `~/`. Whitespace, shell expansions, traversal through `..`, and symlink components are rejected. Use uncomplicated dedicated mount directories when your normal directory names contain spaces. Relative remote paths are resolved by the SFTP server, whose view may differ from a login shell.
+The boolean settings accept `yes` or `no`. Leave the defaults for the complete one-command workflow. Change them when your environment needs different behavior. Secrets belong in the private rclone configuration or the local credential mechanism used by your trusted login helper, rather than in these settings.
 
-For `perception`, the backing-mount check resolves a relative remote path beneath each relay account's shell home directory. Its SFTP home must refer to that same location. This lets `~/mnt/share` work when relay accounts have different absolute home paths. If a server's shell and SFTP views differ, use a verified absolute path that works in both, or ask the administrator for an appropriate endpoint.
+`DELTA_LOGIN` is executable local code and must be trusted. It receives the SSH alias and must establish the connection using the configured SSH control socket. A helper that retrieves a password from a local operating-system credential store can keep that existing convenience. Without an executable helper, SSH handles login interactively.
 
-The file must be beneath your home directory and owned by your current user with mode `600`. Its immediate parent directory must be owned by your current user with mode `700`. Path components from your home directory must not be symlinked or writable by other users. These rules also apply when selecting a configuration with `--config` or `XDG_CONFIG_HOME`. An empty existing mountpoint must belong to you. Do not share mountpoints between rows or nest one configured mountpoint inside another. Store credentials elsewhere, and keep this file outside your repository even though it contains no passwords.
+## Private paths and permissions
 
-## Selection and actions
+The mount table and settings must be beneath your home directory, owned by you, and mode `600`. Their immediate parent directory must be mode `700`. Path components from your home directory must not be symlinked or writable by other users. The same principle protects configured helpers, rclone configuration, and SSH control sockets. Keep live configuration outside the repository.
 
-With no action, `mownt` runs `up`. With no group selector, it operates on every configured group. Selectors can be combined. Each group contains only the rows present in your file.
+## Commands
+
+With no action, `mownt` runs `up`. With no group selector, it operates on every configured group. Selectors can be combined.
 
 | Command | Result |
 | --- | --- |
-| `mownt` or `mownt up` | Mount configured directories. |
-| `mownt down` | Normally unmount configured directories. |
-| `mownt status` | Report local mount state and responsiveness. |
-| `mownt doctor` | Validate local configuration and dependencies without a network connection. |
+| `mownt` or `mownt up` | Connect, repair required services, and mount configured drives. |
 | `mownt -t` or `mownt --theia` | Select `theia`. |
 | `mownt -d` or `mownt --delta` | Select `delta`. |
-| `mownt -p` or `mownt --perception` | Select `perception`. |
+| `mownt -p` or `mownt --perception` | Select the share relay group. |
 | `mownt -a` or `mownt --all` | Select all groups. |
-| `mownt --config "$HOME/.config/mownt-alt/mounts.tsv"` | Use a specific private configuration file. |
-| `mownt --dry-run` | Print planned arguments without creating directories or mounts. |
-| `mownt down --force -p` | Explicitly request forced unmounting or lazy detachment of `perception`. |
-| `mownt --help` | Show accepted options. |
+| `mownt down` or `mownt -x` | Unmount selected drives, using configured recovery behavior. |
+| `mownt status` or `mownt -s` | Report local mount state and responsiveness. |
+| `mownt doctor` | Check local configuration and dependencies without network operations. |
+| `mownt setup` or `mownt -setup` | Provision and synchronize the configured share relays. |
+| `mownt passwd` or `mownt -pw` | Update the saved SMB credential and synchronize and refresh relays. |
+| `mownt --dry-run` | Preview the selected operation without making changes. |
+| `mownt down --force -p` | Explicitly request force or detach for selected share mounts. |
+| `mownt --config "$HOME/.config/mownt-alt/mounts.tsv"` | Use another private configuration. |
+| `mownt --help` | Show accepted arguments. |
+| `mownt --version` | Print the installed version. |
 
-The single-dash legacy selectors `-theia`, `-delta`, `-perception`, `-all`, `-down`, and `-status` remain available. Legacy `-setup` and password-update options return an error directing you to manual administration. The [migration guide](migration.md) explains the changes.
+The longer single-dash legacy selectors remain available. `passwd` updates saved client credentials; the account's actual password is changed through its owning service.
 
-## Mount behavior
+## Daily lifecycle
 
-For a new mount, aliases are tried in their configured order. A successful mount ends the attempt for that row. Each `perception` candidate must first pass a fixed remote `mountpoint` check over noninteractive SSH, requiring approved key, agent, or certificate authentication and the relay's Linux `mountpoint` utility. Failover establishes a fresh mount; it does not migrate open files or guarantee that two relays contain identical data. Confirm that every listed relay exposes the same directory and access policy.
+For direct SSHFS drives, `mownt` opens or reuses each host's SSH master before mounting its directories. The shared connection lets a host's mounts reuse the password or multifactor approval until that connection expires. The configured login helper can establish the Delta master using an existing local credential workflow.
 
-The command requires trusted host keys and disables SSH connection sharing and forwarding for its connections. It does not accept arbitrary extra SSHFS options. SSH configuration remains a trusted local input, so inspect aliases and included files before using unfamiliar configuration.
+For the share, the command starts configured network access, tries relay aliases in order, installs missing rclone from a pinned official artifact with a matching SHA256 checksum, synchronizes only the selected SMB block, and runs the managed backing-share helper. A failed candidate leads to the next alias. If none succeeds and direct fallback is enabled, local rclone attempts the same share.
 
-An existing live mount is left in place. A mounted but unresponsive path is reported as stale and requires an explicit unmount before mounting again. An unmounted nonempty directory is refused so that local files are not hidden. Normal unmounting may fail while applications use the filesystem. Close those applications and retry before considering force. On Linux, force uses lazy detachment. A detached path does not establish that the filesystem process has exited or pending data has been flushed.
+A live expected mount is reused. A stale expected local mount is unmounted and recreated, with client force escalation controlled by `AUTO_FORCE`. Relay backing-share recovery separately attempts normal unmounting and then lazy detachment when necessary. A foreign mount or a nonempty unmounted directory is refused. Force can interrupt open work; on Linux, lazy detachment does not prove that the filesystem process has exited or pending writes have completed.
 
-`status` reports local filesystem responsiveness. It cannot establish that the remote data is current, that cached writes are durable, or that a second filesystem behind a relay remains mounted. Exit status zero indicates command success. Failed operations and stale status produce a nonzero result. Invalid arguments and removed legacy actions also fail. Use the command's diagnostic text to identify the cause.
+`status` checks local responsiveness. It does not prove remote write durability or that a backing share remains mounted after its initial check. Exit status zero indicates success; failed operations and invalid configuration return a nonzero result with a diagnostic.

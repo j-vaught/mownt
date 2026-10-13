@@ -4,9 +4,9 @@
 # The perception remote path must be an existing active mountpoint on each relay.
 # Relative paths and ~/ paths resolve from each relay account's own home.
 # No passwords, tokens, private keys, hostnames, or account identifiers belong here.
-theia	theia-home	theia	/home/example	~/mnt/theia-home	ro
-theia	theia-work	theia	/work/example	~/mnt/theia-work	ro
-delta	delta-home	delta	/home/example	~/mnt/delta-home	ro
-delta	delta-scratch	delta	/scratch/example	~/mnt/delta-scratch	ro
-delta	delta-projects	delta	/projects/example	~/mnt/delta-projects	ro
-perception	perception-share	relay-a,relay-b	~/mnt/share	~/mnt/perception-share	ro
+theia	theia-home	theia	/home/example	~/theia-home	rw
+theia	theia-work	theia	/work/example	~/theia-work	rw
+delta	delta-home	delta	/home/example	~/delta-home	rw
+delta	delta-scratch	delta	/scratch/example	~/delta-scratch	rw
+delta	delta-projects	delta	/projects/example	~/delta-projects	rw
+perception	perception-share	relay-a,relay-b	~/mnt/share	~/perception-share	rw

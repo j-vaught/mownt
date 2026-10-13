@@ -59,26 +59,44 @@ check_target() {
         [ "$FORCE" -eq 1 ] || { error "already exists: $path (inspect it, then use --force to replace)"; return 1; }
     fi
 }
-# Validate every destination before changing any files.
-check_path "$PREFIX/bin" && check_path "$PREFIX/share/mownt" || exit 1
-check_target "$PREFIX/bin/mownt" && check_target "$PREFIX/share/mownt/mounts.example.tsv" || exit 1
-if [ ! -f "$SOURCE_DIR/bin/mownt" ] || [ -L "$SOURCE_DIR/bin/mownt" ] || [ ! -f "$SOURCE_DIR/config/mounts.example.tsv" ] || [ -L "$SOURCE_DIR/config/mounts.example.tsv" ]; then
-    error 'release source files are missing or symlinked'; exit 1
-fi
+# Validate every destination and package source before changing any files.
+sources=("$SOURCE_DIR/bin/mownt" "$SOURCE_DIR/config/mounts.example.tsv" "$SOURCE_DIR/config/automation.example.conf" "$SOURCE_DIR/libexec/mownt-relay")
+targets=("$PREFIX/bin/mownt" "$PREFIX/share/mownt/mounts.example.tsv" "$PREFIX/share/mownt/automation.example.conf" "$PREFIX/share/mownt/libexec/mownt-relay")
+modes=(755 600 600 700)
+for directory in "$PREFIX/bin" "$PREFIX/share/mownt" "$PREFIX/share/mownt/libexec"; do
+    check_path "$directory" || exit 1
+done
+for target in "${targets[@]}"; do check_target "$target" || exit 1; done
+for source in "${sources[@]}"; do
+    if [ ! -f "$source" ] || [ -L "$source" ]; then
+        error 'release source files are missing or symlinked'; exit 1
+    fi
+done
 if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'Would install %s to %s\n' "$SOURCE_DIR/bin/mownt" "$PREFIX/bin/mownt"
-    printf 'Would install example configuration to %s\n' "$PREFIX/share/mownt/mounts.example.tsv"
+    index=0
+    while [ "$index" -lt "${#sources[@]}" ]; do
+        printf 'Would install %s to %s\n' "${sources[$index]}" "${targets[$index]}"
+        index=$((index + 1))
+    done
     exit 0
 fi
 umask 077
-mkdir -p "$PREFIX/bin" "$PREFIX/share/mownt" || exit 1
-# Temporary files are in the destination directories, then atomically renamed.
-TMP_BIN=$(mktemp "$PREFIX/bin/.mownt.XXXXXXXX") || exit 1
-TMP_CONFIG=$(mktemp "$PREFIX/share/mownt/.mounts.XXXXXXXX") || { rm -f "$TMP_BIN"; exit 1; }
-trap 'rm -f "$TMP_BIN" "$TMP_CONFIG"' EXIT
+mkdir -p "$PREFIX/bin" "$PREFIX/share/mownt/libexec" || exit 1
+# Stage every file on its destination filesystem before publishing the command.
+temporaries=()
+cleanup() { for temporary in "${temporaries[@]}"; do rm -f "$temporary"; done; }
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-cat "$SOURCE_DIR/bin/mownt" > "$TMP_BIN" && chmod 755 "$TMP_BIN" && cat "$SOURCE_DIR/config/mounts.example.tsv" > "$TMP_CONFIG" && chmod 600 "$TMP_CONFIG" || exit 1
-mv -f "$TMP_BIN" "$PREFIX/bin/mownt" && mv -f "$TMP_CONFIG" "$PREFIX/share/mownt/mounts.example.tsv" || exit 1
+index=0
+while [ "$index" -lt "${#sources[@]}" ]; do
+    target=${targets[$index]}
+    temporary=$(mktemp "${target%/*}/.mownt-install.XXXXXXXX") || exit 1
+    temporaries+=("$temporary")
+    cat "${sources[$index]}" > "$temporary" && chmod "${modes[$index]}" "$temporary" || exit 1
+    index=$((index + 1))
+done
+# The installed command becomes visible only after its helper and templates.
+for index in 1 2 3 0; do mv -f "${temporaries[$index]}" "${targets[$index]}" || exit 1; done
 printf 'Installed %s\n' "$PREFIX/bin/mownt"
-printf 'Example %s\nCreate a private config following docs/setup.md before running mownt.\n' "$PREFIX/share/mownt/mounts.example.tsv"
+printf 'Examples %s\nCreate private configuration following docs/setup.md before running mownt.\n' "$PREFIX/share/mownt"

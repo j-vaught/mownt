@@ -1,103 +1,106 @@
 # Set up a new computer
 
-This guide creates a user-level installation with read-only mounts for its first test. You need an account on each remote server, permission to use SFTP, and the server's host-key fingerprints from its administrator or another authenticated channel. Substitute your own accounts, hostnames, and remote paths for every example.
+Install the filesystem tools, configure your accounts once, and run `mownt setup`. After that, the daily command is `mownt`. It opens the required connections, reuses your authentication, prepares and repairs share relays, and mounts the drives.
 
-## Install the filesystem tools
+## Install the local tools
 
-On macOS, install the current macFUSE runtime and its SSHFS package from the [official download page](https://macfuse.github.io/). They are separate installers. Follow the runtime's instructions for your macOS version and restart when required. The [official SSHFS installation guide](https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS) explains how to check its signed installer certificate. macOS already includes Bash and SSH. Install Apple's command-line developer tools if `git` is unavailable.
+On macOS, install the current macFUSE runtime and SSHFS package from the [official download page](https://macfuse.github.io/). They are separate installers. Complete the runtime's operating-system approval and restart steps. The [SSHFS installation guide](https://github.com/macfuse/macfuse/wiki/File-Systems-%E2%80%90-SSHFS) explains its signed installer certificate. macOS already includes Bash and SSH. If Git is missing, install Apple's command-line tools.
 
 ```sh
 xcode-select --install
 ```
 
-On Debian or Ubuntu, install distribution packages. Debian publishes the [SSHFS package and dependencies](https://packages.debian.org/stable/sshfs).
+Install local rclone for share configuration, saved-password updates, and direct fallback. With an existing Homebrew installation, use `brew install rclone`; other supported methods appear in the [official rclone installation guide](https://rclone.org/install/).
+
+On Debian or Ubuntu, install the distribution packages. Debian publishes the [SSHFS package and dependencies](https://packages.debian.org/stable/sshfs).
 
 ```sh
 sudo apt update
-sudo apt install bash git openssh-client sshfs
+sudo apt install bash git openssh-client sshfs rclone curl unzip
 ```
 
 On Fedora, the SSHFS package is named [fuse-sshfs](https://packages.fedoraproject.org/pkgs/fuse-sshfs/fuse-sshfs/).
 
 ```sh
-sudo dnf install bash git openssh-clients fuse-sshfs
+sudo dnf install bash git openssh-clients fuse-sshfs rclone curl unzip
 ```
 
-For another Linux distribution, use its supported SSHFS and FUSE packages. The runtime needs working user mounts and `fusermount3` or `fusermount`. Containers and managed computers may restrict FUSE even when the command is installed. Run `mownt` as yourself. Administrative privileges are needed only when the operating system requires them to install dependencies.
+Use your distribution's equivalents elsewhere. Run `mownt` as your regular user. Each Linux relay needs working user-level FUSE mounts, SFTP, and the normal shell utilities used by its managed helper. Missing rclone is installed automatically in that account; enabling FUSE on a restricted server remains an operating-system administrator task.
 
-## Install mownt
+## Install mownt and its private settings
 
-Clone the public repository and inspect the source and installation preview. The installer creates `bin/mownt` and `share/mownt/mounts.example.tsv` below its prefix. It does not create a live mount configuration.
+Clone the repository, inspect the command, and install it into `~/.local`.
 
 ```sh
 git clone https://github.com/j-vaught/mownt.git
 cd mownt
-less bin/mownt install.sh
-./install.sh --dry-run
+less bin/mownt libexec/mownt-relay install.sh
 ./install.sh
 export PATH="$HOME/.local/bin:$PATH"
-command -v mownt
-mownt --help
 ```
 
-Add the following line once to `~/.zshrc` for an interactive Zsh shell, or to the appropriate startup file for your shell. Open a new terminal afterward.
+Add the `export PATH` line once to `~/.zshrc` for an interactive Zsh shell or to your shell's appropriate startup file. A custom prefix beneath your home directory is supported through `./install.sh --prefix "$HOME/tools/mownt"`; use its `bin` and `share/mownt` paths below.
 
-```sh
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-A custom prefix beneath your home directory is supported through `./install.sh --prefix "$HOME/tools/mownt"`. Put that prefix's `bin` directory on `PATH` and use its `share/mownt/mounts.example.tsv` in the configuration step below. The installer rejects symlinks and group- or world-writable path components. Review `type -a mownt` if an older installation is already present.
-
-## Create SSH identities and aliases
-
-Create a private SSH directory without replacing existing keys or configuration.
+Create the private configuration directory and copy both templates. These commands preserve existing live files.
 
 ```sh
 umask 077
-mkdir -p "$HOME/.ssh"
-chmod 700 "$HOME/.ssh"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mownt"
+mkdir -p "$config_dir"
+chmod 700 "$config_dir"
+test ! -e "$config_dir/mounts.tsv" && cp "$HOME/.local/share/mownt/mounts.example.tsv" "$config_dir/mounts.tsv"
+test ! -e "$config_dir/automation.conf" && cp "$HOME/.local/share/mownt/automation.example.conf" "$config_dir/automation.conf"
+chmod 600 "$config_dir/mounts.tsv" "$config_dir/automation.conf"
+"${EDITOR:-vi}" "$config_dir/mounts.tsv"
+"${EDITOR:-vi}" "$config_dir/automation.conf"
 ```
 
-Where your institution allows public-key authentication, generate a separate passphrase-protected key for this computer. Keep the private key on this computer and register only its `.pub` file with the server through the institution's approved process. Use a new filename if this example already exists.
+Replace the template's remote account paths and keep only drives you use. The six fields use literal tabs. Local mountpoints preserve the familiar `~/theia-home`, `~/theia-work`, `~/delta-home`, `~/delta-scratch`, `~/delta-projects`, and `~/perception_wang` layout. The template uses `rw` for normal file access; set a row to `ro` when you want read-only access. The [configuration reference](configuration.md) describes the fields and automation settings.
+
+## Configure SSH once
+
+Create private SSH and connection-sharing directories. Preserve existing keys and configuration.
+
+```sh
+umask 077
+mkdir -p "$HOME/.ssh/cm"
+chmod 700 "$HOME/.ssh" "$HOME/.ssh/cm"
+```
+
+Where your institution permits public-key authentication, create a passphrase-protected key for this computer and register only its `.pub` file through the approved account process. Choose a new filename if this one already exists.
 
 ```sh
 ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519_mownt"
 ```
 
-Add the following entries to `~/.ssh/config`, preserving your existing entries. Put specific host entries before broad `Host *` defaults. Replace all `.example.org` addresses and `YOUR_ACCOUNT` values. SSH chooses its first applicable setting, as described in the [SSH configuration manual](https://man.openbsd.org/ssh_config).
+Add the following example to `~/.ssh/config`, replacing every address and account. Keep specific entries before broad defaults, because SSH uses its first applicable value. The [SSH configuration manual](https://man.openbsd.org/ssh_config) describes this ordering and connection sharing.
 
 ```sshconfig
 Host theia
     HostName compute.example.org
     User YOUR_ACCOUNT
-    IdentityFile ~/.ssh/id_ed25519_mownt
-    IdentitiesOnly yes
-    StrictHostKeyChecking yes
-    ForwardAgent no
-    ForwardX11 no
 
 Host delta
     HostName cluster.example.org
     User YOUR_ACCOUNT
-    StrictHostKeyChecking yes
-    ForwardAgent no
-    ForwardX11 no
 
 Host relay-a
     HostName relay-a.example.org
     User YOUR_ACCOUNT
-    IdentityFile ~/.ssh/id_ed25519_mownt
-    IdentitiesOnly yes
-    StrictHostKeyChecking yes
-    ForwardAgent no
-    ForwardX11 no
 
 Host relay-b
     HostName relay-b.example.org
     User YOUR_ACCOUNT
+
+Host theia relay-a relay-b
     IdentityFile ~/.ssh/id_ed25519_mownt
     IdentitiesOnly yes
+
+Host theia delta relay-a relay-b
     StrictHostKeyChecking yes
+    ControlMaster auto
+    ControlPath ~/.ssh/cm/%C
+    ControlPersist 12h
     ForwardAgent no
     ForwardX11 no
 ```
@@ -106,69 +109,70 @@ Host relay-b
 chmod 600 "$HOME/.ssh/config"
 ```
 
-The `delta` example deliberately leaves authentication to the server's password and multifactor authentication policy. Do not add passwords to this file, shell scripts, environment variables, or command arguments. Use institutional instructions for certificate, hardware-key, Kerberos, or other required authentication.
+Password and multifactor authentication remain available for `delta` without a key. `mownt` opens one shared connection per host, so the host's drives reuse that authenticated session. If you already use a trusted executable at `~/.ssh/delta-login`, the default `DELTA_LOGIN` setting uses it. The helper receives the SSH alias and must establish the same configured master connection. Keep any password retrieval in your local credential store. No helper is required; ordinary SSH prompts work.
 
-## Verify each server before mounting
+To retain an existing helper on a new computer, transfer that reviewed file through a private authenticated channel, keep it owned by your account with mode `700`, and recreate its required local credential-store entry. On macOS, use Keychain Access for that local entry according to the helper's expected service and account names. The helper and credential are separate from this public repository.
 
-Obtain the expected SHA256 host-key fingerprints from an authenticated administrator portal, an administrator contacted independently, or an existing trusted management channel. Then make a one-time interactive connection using `ask` and no connection sharing.
+For a passphrase-protected key, load it into the SSH agent supplied by your operating system or desktop session. The master can then authenticate without repeated key-passphrase prompts.
+
+```sh
+ssh-add "$HOME/.ssh/id_ed25519_mownt"
+```
+
+## Verify server identities
+
+Obtain each server's SHA256 host-key fingerprint from an authenticated administrator portal or an independent trusted channel. Make a one-time connection without sharing, compare its displayed fingerprint, and accept it only when it matches.
 
 ```sh
 ssh -o ControlPath=none -o StrictHostKeyChecking=ask theia
 ```
 
-Compare the displayed fingerprint against the independently obtained value before answering `yes`. Stop if they differ. Exit the remote shell after verification, then repeat for every configured alias, including each relay. `ssh-keyscan` alone does not authenticate a server. Do not blindly append its output to `known_hosts`.
-
-Subsequent connections must pass strict checking. Confirm SFTP as well as SSH, because the filesystem uses the SFTP subsystem.
+Exit that shell and repeat for `delta` and every configured relay. `ssh-keyscan` alone does not authenticate a host. Future connections use strict verification. Confirm that each server exposes the intended path through SFTP if its directory layout is unfamiliar.
 
 ```sh
-ssh -o ControlPath=none -o StrictHostKeyChecking=yes theia true
-sftp -o ControlPath=none -o StrictHostKeyChecking=yes theia
+sftp theia
 ```
 
-Inside SFTP, use `pwd` and `ls` to find the directory visible to your account, then `quit`. Some managed servers expose paths different from their shell paths. Preserve existing `known_hosts` entries and keep its permissions private.
+Use `pwd` and `ls` in SFTP, then `quit`. The mount table must use paths visible through that subsystem. For a home-relative relay share, the account's shell and SFTP home directories must refer to the same location.
 
-```sh
-chmod 600 "$HOME/.ssh/known_hosts"
-```
+## Enter the share credential locally
 
-`mownt` disables connection sharing with `ControlPath=none`, so an existing SSH master does not pre-authenticate it. You may receive a separate password or multifactor prompt for each filesystem. This avoids inheriting trust or forwarding from an older shared connection. If you use multiplexing for unrelated SSH sessions, protect its socket directory with mode `700` and follow the [SSH control-socket guidance](https://man.openbsd.org/ssh_config#ControlPath).
-
-## Create your private mount table
-
-Create the configuration directory and copy the template. These commands use the default installation prefix. Do not replace a configuration you already use.
+Run rclone's interactive configuration and create an SMB remote named `perception`, matching the default `SMB_REMOTE`. Enter your actual server, account, domain, and password at its prompts. The [SMB backend guide](https://rclone.org/smb/) describes those fields and supported authentication methods.
 
 ```sh
 umask 077
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/mownt"
-mkdir -p "$config_dir"
-chmod 700 "$config_dir"
-test ! -e "$config_dir/mounts.tsv" && cp "$HOME/.local/share/mownt/mounts.example.tsv" "$config_dir/mounts.tsv"
-chmod 600 "$config_dir/mounts.tsv"
-"${EDITOR:-vi}" "$config_dir/mounts.tsv"
+mkdir -p "$HOME/.config/rclone"
+chmod 700 "$HOME/.config/rclone"
+rclone config
+chmod 600 "$HOME/.config/rclone/rclone.conf"
 ```
 
-Keep only rows you need. Replace remote paths with the paths established through SFTP and use empty dedicated directories beneath your home directory as mountpoints. Leave every row in mode `ro` for the first test. The file uses six literal tab-separated fields. Follow the [configuration reference](configuration.md) when editing it.
+Set `SMB_SHARE` in `automation.conf` to the actual share name. If you chose a different remote name or configuration location, update `SMB_REMOTE` or `RCLONE_CONFIG` accordingly. Settings contain names and paths; the credential stays in the private rclone configuration.
 
-## Verify the first mount
+Use the ordinary rclone INI configuration with its obscured password field. Whole-file encrypted configurations cannot be merged by the automatic synchronization path. Keep this file and its parent private as shown above.
 
-Run the local checks and command preview before connecting. `doctor` checks local setup and does not contact servers. A passing result does not establish remote access.
+Configured relay aliases are trusted destinations for this selected SMB credential. `mownt` synchronizes only that named block over authenticated SSH into private files on those accounts. This lets any selected relay mount the share on your behalf. Configure only approved hosts you trust with that access. The [relay guide](relay.md) describes provisioning and credential updates.
+
+If those hosts require Tailscale, install its official client using the [macOS guide](https://tailscale.com/docs/install/mac) or [Linux guide](https://tailscale.com/docs/install/linux) and enroll this computer once. After enrollment, `TAILSCALE=auto` lets `mownt` bring the connection up when needed.
+
+## Start using the drives
+
+Validate the local files, provision the configured relays, and mount everything.
 
 ```sh
 mownt doctor
-mownt --dry-run -t
-mownt -t
+mownt setup
+mownt
 mownt status
-ls "$HOME/mnt/theia-home"
-mownt down -t
 ```
 
-Confirm that the directory contents belong to the expected remote filesystem. If you need write access, edit the intended row from `ro` to `rw`, remount that group, and test a disposable file in an authorized scratch directory. Close the file and confirm it is visible through a separate trusted server session before relying on the mount for work.
+`setup` is useful for checking initial relay access. Ordinary `mownt` also installs or repairs missing relay components automatically. For daily work, use `mownt`, `mownt -t`, `mownt -d`, or `mownt -p`. Close your files when finished and use `mownt down` to unmount.
 
-Once the direct mounts work, configure [optional relays](relay.md), then test `mownt -p`. Keep a separate backup of important remote data. Filesystem access through SSHFS does not create backups.
+When the account's SMB password changes, run `mownt passwd`. Enter the new value at its hidden prompt. The command updates the saved local credential, synchronizes reachable relays, and refreshes the share mounts. A relay that is offline receives the current configuration on a later run.
 
 ## Upgrade and uninstall
 
-Unmount normally and review the update before installing it. The installer requires `--force` to replace the installed command and example template. It leaves the live configuration untouched.
+Unmount, inspect updates, and reinstall over the installed command and templates. Your live private configuration stays in place.
 
 ```sh
 mownt down
@@ -176,18 +180,20 @@ git fetch origin
 git log --oneline HEAD..origin/main
 git diff HEAD..origin/main
 git pull --ff-only
-./install.sh --dry-run --force
 ./install.sh --force
 mownt doctor
 ```
 
-To uninstall the default-prefix files, first stop using the mounts and run a normal unmount. Remove only the installed command and template.
+To remove the default-prefix client files, unmount and remove the installed command, helper, and templates.
 
 ```sh
 mownt down
 rm -- "$HOME/.local/bin/mownt"
 rm -- "$HOME/.local/share/mownt/mounts.example.tsv"
+rm -- "$HOME/.local/share/mownt/automation.example.conf"
+rm -- "$HOME/.local/share/mownt/libexec/mownt-relay"
+rmdir "$HOME/.local/share/mownt/libexec"
 rmdir "$HOME/.local/share/mownt"
 ```
 
-For a custom prefix, use its corresponding paths. Keep your mount table and SSH settings until you decide whether they are still needed. Remove empty mountpoint directories with `rmdir` only after confirming they are unmounted. Never recursively delete a mountpoint to uninstall the command. Uninstall SSHFS or FUSE separately through the installation method you used if no other applications depend on them.
+Keep your SSH settings and rclone configuration while other tools still use them. Managed relay files and upstream credentials remain on the configured hosts until you remove them deliberately. Use `rmdir` only for empty, verified unmounted local mountpoint directories. Never recursively delete a mountpoint to uninstall the command.

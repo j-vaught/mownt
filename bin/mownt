@@ -1,8 +1,9 @@
 #!/bin/bash
 # Copyright J.C. Vaught. See LICENSE.
 # User-owned SSHFS mounts. Configuration is data, never shell code.
+set +x
 set -o pipefail
-VERSION=1.0.0
+VERSION=1.1.0
 ACTION=up
 ACTION_SET=0
 DRY_RUN=0
@@ -10,22 +11,24 @@ FORCE=0
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/mownt/mounts.tsv"
 GROUPS_SELECTED=()
 GROUPS_CFG=(); LABELS=(); ALIASES=(); REMOTES=(); LOCALS=(); MODES=()
-SSH_OPTIONS=(-o StrictHostKeyChecking=yes -o ForwardAgent=no -o ForwardX11=no -o ForwardX11Trusted=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+SSH_OPTIONS=(-o StrictHostKeyChecking=yes -o ForwardAgent=no -o ForwardX11=no -o ForwardX11Trusted=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 err() { printf 'mownt: %s\n' "$*" >&2; }
 fail_config() { err "$*"; exit 2; }
 usage() {
     cat <<'HELP'
-Usage: mownt [up|down|status|doctor] [OPTIONS]
+Usage: mownt [up|down|status|doctor|setup|passwd] [OPTIONS]
   -t, --theia         Select Theia entries.
   -d, --delta         Select Delta entries.
   -p, --perception    Select perception relay entries.
   -a, --all           Select every configured entry (default).
   --config FILE      Read a private six-column TSV configuration.
   --dry-run          Show planned commands without changing files or mounts.
-  --force            Request forced unmount; allowed only with down.
+  --force            Force unmount immediately; down only (normal down escalates).
   -x, --down          Unmount selected entries.
   -s, --status        Check selected local mounts, with bounded health probes.
   --doctor           Check local configuration and dependencies, without network.
+  -setup, --setup    Provision all selected relay candidates.
+  -pw, --passwd      Update stored SMB password and synchronize relays.
   -h, --help         Show help.
   --version          Print version.
 
@@ -54,8 +57,8 @@ while [ "$#" -gt 0 ]; do
         --force) FORCE=1 ;;
         -h|-help|--help|help) usage; exit 0 ;;
         --version) printf 'mownt %s\n' "$VERSION"; exit 0 ;;
-        setup|-setup|--setup|passwd|-pw|-passwd|--passwd)
-            err 'Provision relays and rotate credentials manually. See docs/setup.md; automatic credential copying is intentionally unavailable.'; exit 2 ;;
+        setup|-setup|--setup) set_action setup ;;
+        passwd|-pw|-passwd|--passwd) set_action passwd ;;
         *) fail_config "unknown argument: $1" ;;
     esac
     shift
@@ -112,6 +115,47 @@ safe_path() {
     [ -n "$path" ] && [ "$path" != / ] && [ "${path%/}" = "$path" ]
 }
 valid_alias() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; }
+# Optional settings remain data. No shell expansion, source, or eval is used.
+SSH_MASTER=yes; TAILSCALE=auto; DELTA_LOGIN="$HOME/.ssh/delta-login"
+AUTO_PROVISION=yes; AUTO_FORCE=yes; DIRECT_FALLBACK=yes
+SMB_REMOTE=perception; SMB_SHARE=share
+RCLONE_CONFIG="$HOME/.config/rclone/rclone.conf"
+AUTOMATION="$CONFIG_DIR/automation.conf"
+if [ -e "$AUTOMATION" ] || [ -L "$AUTOMATION" ]; then
+    check_private "$AUTOMATION" 600
+    setting_keys=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ''|'#'*) continue ;; esac
+        [[ "$line" == *=* ]] || fail_config 'automation.conf requires KEY=value lines'
+        key=${line%%=*}; value=${line#*=}
+        for previous in "${setting_keys[@]}"; do [ "$key" != "$previous" ] || fail_config "duplicate setting: $key"; done
+        setting_keys+=("$key")
+        case "$key" in
+            SSH_MASTER|AUTO_PROVISION|AUTO_FORCE|DIRECT_FALLBACK)
+                case "$value" in yes|no) ;; *) fail_config "$key requires yes or no" ;; esac ;;
+            TAILSCALE) case "$value" in auto|off) ;; *) fail_config 'TAILSCALE requires auto or off' ;; esac ;;
+            SMB_REMOTE) [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail_config 'invalid SMB_REMOTE' ;;
+            SMB_SHARE)
+                safe_path "$value" || fail_config 'invalid SMB_SHARE'
+                case "$value" in /*|\~*|-*) fail_config 'SMB_SHARE must be a relative share/path' ;; esac ;;
+            DELTA_LOGIN|RCLONE_CONFIG)
+                if [ "$key" = DELTA_LOGIN ] && [ "$value" = none ]; then :
+                else
+                    safe_path "$value" || fail_config "invalid $key path"
+                    case "$value" in \~/*) value="$HOME/${value#\~/}" ;; esac
+                    case "$value" in "$HOME"/*) ;; *) fail_config "$key must be below HOME" ;; esac
+                fi ;;
+            *) fail_config "unknown automation setting: $key" ;;
+        esac
+        printf -v "$key" '%s' "$value"
+    done < "$AUTOMATION"
+fi
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
+if [ -f "$SCRIPT_DIR/../libexec/mownt-relay" ]; then
+    RELAY_HELPER="$SCRIPT_DIR/../libexec/mownt-relay"
+else RELAY_HELPER="$SCRIPT_DIR/../share/mownt/libexec/mownt-relay"; fi
+STATE_DIR="$CONFIG_DIR/state"
+MASTER_HOSTS=(); MASTER_SOCKETS=()
 line_no=0
 while IFS= read -r line || [ -n "$line" ]; do
     line_no=$((line_no + 1))
@@ -127,11 +171,9 @@ while IFS= read -r line || [ -n "$line" ]; do
     for alias in "${candidates[@]}"; do valid_alias "$alias" || fail_config "line $line_no: invalid SSH alias"; done
     safe_path "$remote" || fail_config "line $line_no: unsafe remote path"
     case "$remote" in -*) fail_config "line $line_no: option-like remote path" ;; esac
-    if [ "$group" = perception ]; then
-        # SFTP relative paths resolve inside each relay account's own HOME.
-        # Normalize the optional home shorthand without local expansion.
-        case "$remote" in \~/*) remote=${remote#\~/} ;; esac
-    fi
+    # SFTP relative paths resolve inside each account's own HOME.
+    case "$remote" in \~/*) remote=${remote#\~/} ;; esac
+    case "$remote" in -*) fail_config "line $line_no: option-like remote path" ;; esac
     safe_path "$local_path" || fail_config "line $line_no: unsafe local path"
     case "$local_path" in \~/*) local_path="$HOME/${local_path#\~/}" ;; esac
     case "$local_path" in "$HOME"/*) ;; *) fail_config "line $line_no: local path must be below HOME" ;; esac
@@ -173,7 +215,7 @@ expected_source() {
 run_timeout() {
     local seconds=$1 pid elapsed=0 rc
     shift
-    "$@" & pid=$!
+    "$@" <&0 & pid=$!
     while kill -0 "$pid" 2>/dev/null; do
         if [ "$elapsed" -ge "$seconds" ]; then
             kill -TERM "$pid" 2>/dev/null
@@ -215,96 +257,555 @@ check_local_path() {
         [ -z "$entries" ] || { err "mountpoint is not empty: $path"; return 1; }
     fi
 }
-unmount_entry() {
-    local mp=$1
-    if [ "$SYSTEM" = Darwin ]; then
-        if [ "$FORCE" -eq 1 ]; then command=(diskutil unmount force "$mp"); else command=(diskutil unmount "$mp"); fi
-    elif command -v fusermount3 >/dev/null 2>&1; then
-        if [ "$FORCE" -eq 1 ]; then command=(fusermount3 -uz "$mp"); else command=(fusermount3 -u "$mp"); fi
-    elif command -v fusermount >/dev/null 2>&1; then
-        if [ "$FORCE" -eq 1 ]; then command=(fusermount -uz "$mp"); else command=(fusermount -u "$mp"); fi
-    else
-        if [ "$FORCE" -eq 1 ]; then command=(umount -f "$mp"); else command=(umount "$mp"); fi
+# Files used for connection sockets and direct-backend ownership records.
+ensure_state() {
+    if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+    [ ! -L "$STATE_DIR" ] || { err 'state directory is symlinked'; return 1; }
+    ( umask 077; mkdir -p "$STATE_DIR" ) || return 1
+    check_private "$STATE_DIR" 700
+}
+# Validate an existing user-owned local file and every ancestor below HOME.
+trusted_file() {
+    local file=$1 cursor=$HOME rest component data owner mode
+    case "$file" in "$HOME"/*) ;; *) err "untrusted path: $file"; return 1 ;; esac
+    rest=${file#"$HOME"/}
+    while [ -n "$rest" ]; do
+        [ ! -L "$cursor" ] && [ -d "$cursor" ] || return 1
+        data=$(metadata "$cursor" 2>/dev/null) || return 1
+        read -r owner mode <<< "$data"
+        [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 8#022))" -eq 0 ] || return 1
+        component=${rest%%/*}
+        if [ "$component" = "$rest" ]; then rest=; else rest=${rest#*/}; fi
+        cursor="$cursor/$component"
+    done
+    [ ! -L "$file" ] && [ -f "$file" ] || return 1
+    data=$(metadata "$file" 2>/dev/null) || return 1
+    read -r owner mode <<< "$data"
+    [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 8#022))" -eq 0 ]
+}
+# Honor a user's private SSH-config socket so existing MFA/login helpers work.
+choose_socket() {
+    local host=$1 candidate parent data owner mode
+    SOCKET="$STATE_DIR/cm-%C"
+    [ "$DRY_RUN" -eq 0 ] || return 0
+    candidate=$(ssh "${SSH_OPTIONS[@]}" -G "$host" 2>/dev/null | awk '$1 == "controlpath" {print $2; exit}') || candidate=
+    case "$candidate" in \~/*) candidate="$HOME/${candidate#\~/}" ;; esac
+    case "$candidate" in "$HOME"/*)
+        parent=$(dirname -- "$candidate")
+        # Token expansion belongs in the socket filename, never its directory.
+        case "$parent" in *[%~]*|*'//'*) return 0 ;; esac
+        if [ -d "$parent" ] && [ ! -L "$parent" ]; then
+            data=$(metadata "$parent" 2>/dev/null) || return 0
+            read -r owner mode <<< "$data"
+            if [ "$owner" = "$(id -u)" ] && [ "$mode" = 700 ]; then
+                # Reuse the ancestry checker using a harmless existing config.
+                # A separate component walk below avoids inspecting socket I/O.
+                local cursor=$HOME rest=${parent#"$HOME"/} component
+                [ "$parent" != "$HOME" ] || rest=
+                while :; do
+                    [ ! -L "$cursor" ] && [ -d "$cursor" ] || return 0
+                    data=$(metadata "$cursor" 2>/dev/null) || return 0
+                    read -r owner mode <<< "$data"
+                    [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 8#022))" -eq 0 ] || return 0
+                    [ -n "$rest" ] || break
+                    component=${rest%%/*}
+                    if [ "$component" = "$rest" ]; then rest=; else rest=${rest#*/}; fi
+                    cursor="$cursor/$component"
+                done
+                SOCKET=$candidate
+            fi
+        fi ;;
+    esac
+}
+ssh_args_for() {
+    local host=$1 n=0
+    SSH_ARGS=("${SSH_OPTIONS[@]}" -o ControlMaster=no -o ControlPath=none)
+    [ "$SSH_MASTER" = yes ] || return 0
+    while [ "$n" -lt "${#MASTER_HOSTS[@]}" ]; do
+        if [ "${MASTER_HOSTS[$n]}" = "$host" ]; then
+            SSH_ARGS=("${SSH_OPTIONS[@]}" -o ControlMaster=no -o "ControlPath=${MASTER_SOCKETS[$n]}")
+            return 0
+        fi
+        n=$((n + 1))
+    done
+}
+ensure_master() {
+    local host=$1 group=$2 n=0
+    [ "$SSH_MASTER" = yes ] || return 0
+    while [ "$n" -lt "${#MASTER_HOSTS[@]}" ]; do
+        [ "${MASTER_HOSTS[$n]}" != "$host" ] || return 0
+        n=$((n + 1))
+    done
+    ensure_state || return 1
+    choose_socket "$host"
+    SSH_ARGS=("${SSH_OPTIONS[@]}" -o "ControlPath=$SOCKET")
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'Reuse or open one SSH master for %s (configured private socket preferred).\n' "$host"
+        print_command ssh -o StrictHostKeyChecking=ask "${SSH_ARGS[@]}" -o ControlMaster=yes -o ControlPersist=12h -fN "$host"
+    elif ! ssh "${SSH_ARGS[@]}" -O check "$host" >/dev/null 2>&1; then
+        if [ "$group" = delta ] && [ "$DELTA_LOGIN" != none ] && [ -x "$DELTA_LOGIN" ]; then
+            trusted_file "$DELTA_LOGIN" || { err 'Delta login helper has unsafe ownership or permissions'; return 1; }
+            "$DELTA_LOGIN" "$host" || { err "login helper failed for $host"; return 1; }
+        fi
+        if ! ssh "${SSH_ARGS[@]}" -O check "$host" >/dev/null 2>&1; then
+            # Ask permits the first interactive fingerprint check; changed keys fail.
+            ssh -o StrictHostKeyChecking=ask "${SSH_ARGS[@]}" -o ControlMaster=yes -o ControlPersist=12h -fN "$host" || return 1
+        fi
+        ssh "${SSH_ARGS[@]}" -O check "$host" >/dev/null 2>&1 || { err "SSH master did not start: $host"; return 1; }
     fi
-    if [ "$DRY_RUN" -eq 1 ]; then print_command "${command[@]}"; return 0; fi
-    "${command[@]}" || return 1
+    MASTER_HOSTS+=("$host"); MASTER_SOCKETS+=("$SOCKET")
+}
+ensure_tailscale() {
+    [ "$TAILSCALE" = auto ] || return 0
+    local binary
+    binary=$(command -v tailscale 2>/dev/null) || binary=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+    [ -x "$binary" ] || return 0
+    if [ "$DRY_RUN" -eq 1 ]; then printf 'If needed, start the configured Tailscale connection.\n'; print_command "$binary" up; return 0; fi
+    "$binary" status >/dev/null 2>&1 && return 0
+    "$binary" up || { err 'Tailscale could not start; trying available network routes'; return 1; }
+}
+find_rclone() {
+    RCLONE=
+    for binary in "$HOME/.local/bin/rclone" "$HOME/bin/rclone"; do
+        if [ -x "$binary" ]; then trusted_file "$binary" || { err "unsafe rclone executable: $binary"; return 1; }; RCLONE=$binary; return 0; fi
+    done
+    RCLONE=$(command -v rclone 2>/dev/null) || { err 'local rclone is unavailable'; return 1; }
+}
+rclone_exec() {
+    # Explicit config and a clean rclone environment avoid accidental overrides.
+    local variable config="$RCLONE_CONFIG" executable="$RCLONE"
+    for variable in ${!RCLONE_@}; do unset "$variable"; done
+    umask 077
+    exec "$executable" --config "$config" "$@"
+}
+rclone_run() ( rclone_exec "$@" )
+check_rclone_config() {
+    trusted_file "$RCLONE_CONFIG" || { err 'rclone configuration must be a private, user-owned regular file below HOME'; return 1; }
+    check_private "$RCLONE_CONFIG" 600
+}
+extract_smb_block() {
+    check_rclone_config || return 1
+    awk -v name="$SMB_REMOTE" '
+        BEGIN {header="[" name "]"; found=0; active=0; valid=1}
+        /^[[:space:]]*\[/ {section=$0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", section); if (section==header) {found++; active=1} else active=0}
+        active {
+            if ($0 ~ /[[:cntrl:]]/ && $0 !~ /\t/) valid=0
+            if ($0 ~ /^[[:space:]]*\[/ || $0 ~ /^[[:space:]]*([#;]|$)/) {print; next}
+            split($0, pieces, "="); key=pieces[1]; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            if (key !~ /^(type|host|user|pass|domain|port|spn|idle_timeout|hide_special_share|case_insensitive|encoding|description|use_kerberos)$/ || seen[key]++) valid=0
+            value=substr($0,index($0,"=")+1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            if (key=="type") smb=(value=="smb")
+            if (key=="host") host=(length(value)>0)
+            if (key=="use_kerberos" && value!="false") valid=0
+            print
+        }
+        END {if (found!=1 || !valid || !smb || !host) exit 1}
+    ' "$RCLONE_CONFIG"
+}
+# Only a nonsecret helper is uploaded. Credentials use a separate stdin channel.
+ensure_relay_helper() {
+    local host=$1
+    [ -f "$RELAY_HELPER" ] && [ ! -L "$RELAY_HELPER" ] || { err 'installed relay helper is missing; reinstall mownt'; return 1; }
+    ssh_args_for "$host"
+    if [ "$DRY_RUN" -eq 1 ]; then printf 'Ensure the shipped helper is current on %s (private atomic upload if needed).\n' "$host"; return 0; fi
+    # Validate managed paths on every use. Byte-identical helpers keep their inode.
+    ssh "${SSH_ARGS[@]}" -o BatchMode=yes "$host" 'bash -c '\''
+set +x
+set -eu
+umask 077
+uid=$(id -u)
+[ "$uid" -ne 0 ] || exit 1
+for dir in "$HOME" "$HOME/.local" "$HOME/.local/libexec" "$HOME/.local/libexec/mownt"; do
+    [ ! -L "$dir" ] || exit 1
+    if [ ! -e "$dir" ]; then mkdir "$dir"; fi
+    [ -d "$dir" ] && [ "$(stat -c %u "$dir")" = "$uid" ] || exit 1
+    mode=$(stat -c %a "$dir")
+    [ "$((8#$mode & 8#022))" -eq 0 ] || exit 1
+done
+chmod 700 "$HOME/.local/libexec/mownt"
+file="$HOME/.local/libexec/mownt/mownt-relay"
+safe_existing=no
+[ ! -L "$file" ] || exit 1
+if [ -e "$file" ]; then
+    [ -f "$file" ] && [ "$(stat -c %u "$file")" = "$uid" ] || exit 1
+    grep -q "^# mownt managed relay helper" "$file" || exit 1
+    if [ "$(stat -c %a "$file")" = 700 ] && [ "$(stat -c %h "$file")" = 1 ]; then safe_existing=yes; fi
+fi
+lock="$HOME/.local/libexec/mownt/.install-lock"
+mkdir "$lock" || exit 1
+tmp=$(mktemp "$HOME/.local/libexec/mownt/.helper.XXXXXXXX") || { rmdir "$lock"; exit 1; }
+cleanup() { rm -f "$tmp"; rmdir "$lock"; }
+trap cleanup EXIT
+cat > "$tmp"
+grep -q "^# mownt managed relay helper" "$tmp" || exit 1
+chmod 700 "$tmp"
+if [ "$safe_existing" = yes ] && cmp -s "$tmp" "$file"; then exit 0; fi
+mv -f "$tmp" "$file"
+'\''' < "$RELAY_HELPER"
+}
+relay_call() {
+    local host=$1 action=$2 path=$3 command
+    # Arguments have already passed conservative identifier/path validation.
+    command="\"\$HOME/.local/libexec/mownt/mownt-relay\" '$action' '$SMB_REMOTE' '$SMB_SHARE' '$path'"
+    ssh_args_for "$host"
+    if [ "$DRY_RUN" -eq 1 ]; then print_command ssh "${SSH_ARGS[@]}" -o BatchMode=yes "$host" "$command"; return 0; fi
+    run_timeout 180 ssh "${SSH_ARGS[@]}" -o BatchMode=yes "$host" "$command"
+}
+prepare_relay() {
+    local host=$1 path=$2 force_setup=${3:-no} healthy=no sync_status
+    ensure_master "$host" perception || return 1
+    if [ "$AUTO_PROVISION" = yes ] || [ "$force_setup" = yes ]; then
+        ensure_relay_helper "$host" || return 1
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf 'Synchronize only [%s] from the private local rclone config to %s, without displaying credentials.\n' "$SMB_REMOTE" "$host"
+            relay_call "$host" setup "$path"; relay_call "$host" mount "$path"
+            return 0
+        fi
+        relay_call "$host" check "$path" >/dev/null 2>&1 && healthy=yes
+        if [ "$healthy" = no ] || [ "$force_setup" = yes ]; then relay_call "$host" setup "$path" || return 1; fi
+        sync_status=$(extract_smb_block | relay_call "$host" sync "$path") || { err "could not securely synchronize SMB config to $host"; return 1; }
+        if [ "$healthy" = yes ] && [ "$sync_status" = unchanged ]; then return 0; fi
+        # Reload also repairs an unhealthy existing expected backing mount.
+        relay_call "$host" reload "$path"
+    else
+        ssh_args_for "$host"
+        local guard_command
+        case "$path" in
+            /*) guard_command="mountpoint -q -- '$path'" ;;
+            *) # shellcheck disable=SC2016
+               guard_command='mountpoint -q -- "$HOME"/'
+               guard_command="${guard_command}'$path'" ;;
+        esac
+        if [ "$DRY_RUN" -eq 1 ]; then print_command ssh "${SSH_ARGS[@]}" -o BatchMode=yes "$host" "$guard_command"
+        else run_timeout 15 ssh "${SSH_ARGS[@]}" -o BatchMode=yes "$host" "$guard_command"; fi
+    fi
+}
+line_at() { printf '%s\n' "$MOUNT_TABLE" | awk -v p="$1" '$2 == "on" && $3 == p {print; exit}'; }
+direct_record() { printf '%s/%s.direct' "$STATE_DIR" "$1"; }
+direct_expected() {
+    local label=$1 mp=$2 file recorded
+    file=$(direct_record "$label")
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    trusted_file "$file" || return 1
+    check_private "$file" 600
+    recorded=$(sed -n '3p' "$file")
+    [ -n "$recorded" ] && [ "$recorded" = "$(line_at "$mp")" ]
+}
+stop_direct_process() {
+    local file pid stamp current n=0
+    file=$(direct_record "$1")
+    [ -f "$file" ] && [ ! -L "$file" ] || return 0
+    trusted_file "$file" || return 1
+    pid=$(sed -n '1p' "$file"); stamp=$(sed -n '2p' "$file")
+    if [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" -gt 1 ] && [ -n "$stamp" ]; then
+        current=$(ps -p "$pid" -o uid= -o lstart= -o command= 2>/dev/null) || current=
+        if [ "$current" = "$stamp" ]; then
+            kill -TERM "$pid" 2>/dev/null || true
+            while [ "$n" -lt 12 ]; do
+                current=$(ps -p "$pid" -o uid= -o lstart= -o command= 2>/dev/null) || current=
+                [ "$current" = "$stamp" ] || break
+                sleep 1; n=$((n + 1))
+            done
+            if [ "$current" = "$stamp" ]; then err 'direct backend is still stopping; retaining its cache and process record'; return 1; fi
+        fi
+    fi
+    rm -f "$file"
+}
+owned_mount() {
+    local label=$1 mp=$2 aliases=$3 remote=$4 source
+    source=$(source_at "$mp")
+    { expected_source "$source" "$aliases" "$remote" && sshfs_at "$mp"; } || direct_expected "$label" "$mp"
+}
+unmount_command() {
+    local mp=$1 force=$2
+    if [ "$SYSTEM" = Darwin ]; then
+        if [ "$force" = yes ]; then command=(diskutil unmount force "$mp"); else command=(diskutil unmount "$mp"); fi
+    elif command -v fusermount3 >/dev/null 2>&1; then
+        if [ "$force" = yes ]; then command=(fusermount3 -uz "$mp"); else command=(fusermount3 -u "$mp"); fi
+    elif command -v fusermount >/dev/null 2>&1; then
+        if [ "$force" = yes ]; then command=(fusermount -uz "$mp"); else command=(fusermount -u "$mp"); fi
+    else
+        if [ "$force" = yes ]; then command=(umount -f "$mp"); else command=(umount "$mp"); fi
+    fi
+}
+unmount_entry() {
+    local label=$1 mp=$2 aliases=$3 remote=$4 force=no
     refresh_mounts || return 1
+    [ -n "$(source_at "$mp")" ] || { [ "$DRY_RUN" -eq 1 ] || stop_direct_process "$label"; return 0; }
+    owned_mount "$label" "$mp" "$aliases" "$remote" || { err 'refusing foreign mount unmount'; return 1; }
+    [ "$FORCE" -eq 0 ] || force=yes
+    unmount_command "$mp" "$force"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        print_command "${command[@]}"
+        if [ "$force" = no ] && [ "$AUTO_FORCE" = yes ]; then unmount_command "$mp" yes; printf 'If normal unmount fails and identity still matches.\n'; print_command "${command[@]}"; fi
+        return 0
+    fi
+    run_timeout 12 "${command[@]}" >/dev/null 2>&1 || true
+    refresh_mounts || return 1
+    if [ -n "$(source_at "$mp")" ] && [ "$force" = no ] && [ "$AUTO_FORCE" = yes ]; then
+        owned_mount "$label" "$mp" "$aliases" "$remote" || { err 'mount identity changed; refusing forced unmount'; return 1; }
+        unmount_command "$mp" yes
+        run_timeout 12 "${command[@]}" >/dev/null 2>&1 || true
+        refresh_mounts || return 1
+    fi
     [ -z "$(source_at "$mp")" ] || { err "mount remains attached: $mp"; return 1; }
+    stop_direct_process "$label"
+}
+mount_direct() {
+    local label=$1 mp=$2 mode=$3 backend=mount pid stamp file temporary log n=0 mounted_line cache direct_source valid current
+    [ "$DIRECT_FALLBACK" = yes ] || return 1
+    if [ "$DRY_RUN" -eq 1 ]; then printf 'If every relay fails, start local rclone %s:%s at %s (private process and mount record).\n' "$SMB_REMOTE" "$SMB_SHARE" "$mp"; return 0; fi
+    find_rclone && check_rclone_config && ensure_state || return 1
+    stop_direct_process "$label" || return 1
+    check_local_path "$mp" || return 1
+    ( umask 077; mkdir -p "$mp" ) || return 1
+    [ "$SYSTEM" != Darwin ] || backend=nfsmount
+    cache="$STATE_DIR/$label.cache"
+    [ ! -L "$cache" ] || { err 'direct cache is symlinked'; return 1; }
+    ( umask 077; mkdir -p "$cache" ) || return 1
+    check_private "$cache" 700
+    command=("$backend" "$SMB_REMOTE:$SMB_SHARE" "$mp" --cache-dir "$cache" --vfs-cache-mode full --vfs-cache-max-size 20G --dir-cache-time 24h --file-perms 0600 --dir-perms 0700 --log-level ERROR)
+    [ "$mode" != ro ] || command+=(--read-only)
+    if [ "$SYSTEM" = Darwin ]; then command+=(--addr 127.0.0.1:0); else command+=(--devname "$SMB_REMOTE:$SMB_SHARE" --umask 077); fi
+    log=$(umask 077; mktemp "$STATE_DIR/$label.log.XXXXXXXX") || return 1
+    # One asynchronous shell execs the backend, so this PID belongs to rclone.
+    rclone_exec "${command[@]}" > "$log" 2>&1 & pid=$!
+    stamp=$(ps -p "$pid" -o uid= -o lstart= -o command= 2>/dev/null) || stamp=
+    while [ "$n" -lt 30 ]; do
+        refresh_mounts || break
+        mounted_line=$(line_at "$mp")
+        valid=no
+        if [ -n "$mounted_line" ]; then
+            direct_source=$(source_at "$mp")
+            if [ "$SYSTEM" = Linux ] && [ "$direct_source" = "$SMB_REMOTE:$SMB_SHARE" ]; then
+                if printf '%s\n' "$mounted_line" | awk -v uid="$(id -u)" '$4=="type" && $5=="fuse.rclone" && $0 ~ "[(,]user_id=" uid "[,)]" {found=1} END {exit !found}'; then valid=yes; fi
+            elif [ "$SYSTEM" = Darwin ]; then
+                case "$direct_source" in localhost:/*|127.0.0.1:/*)
+                    case "$mounted_line" in *' (nfs,'*|*' (nfs)'*) valid=yes ;; esac ;;
+                esac
+            fi
+            [ "$valid" = yes ] || { err 'unexpected filesystem appeared during direct mount; refusing to adopt it'; break; }
+        fi
+        if [ "$valid" = yes ] && health "$mp"; then
+            # Read the stamp only once the background shell has exec'd rclone.
+            stamp=$(ps -p "$pid" -o uid= -o lstart= -o command= 2>/dev/null) || stamp=
+            case "$stamp" in *"$RCLONE --config $RCLONE_CONFIG $backend $SMB_REMOTE:$SMB_SHARE $mp"*) ;; *) err 'direct process identity could not be verified'; break ;; esac
+            file=$(direct_record "$label")
+            [ ! -L "$file" ] || { err 'direct record is a symlink'; return 1; }
+            temporary=$(umask 077; mktemp "$STATE_DIR/.direct.XXXXXXXX") || return 1
+            printf '%s\n%s\n%s\n' "$pid" "$stamp" "$mounted_line" > "$temporary"
+            chmod 600 "$temporary" && mv -f "$temporary" "$file" || return 1
+            printf '%s mounted directly at %s\n' "$label" "$mp"
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1; n=$((n + 1))
+    done
+    # Retain a verified failed-start process record until its cache user exits.
+    # The exec may have completed after the first stamp was observed.
+    current=$(ps -p "$pid" -o uid= -o lstart= -o command= 2>/dev/null) || current=
+    valid=no
+    if [ -n "$stamp" ] && [ "$current" = "$stamp" ]; then valid=yes; fi
+    case "$current" in *"$RCLONE --config $RCLONE_CONFIG $backend $SMB_REMOTE:$SMB_SHARE $mp"*) valid=yes ;; esac
+    if [ "$valid" = yes ]; then
+        file=$(direct_record "$label")
+        [ ! -L "$file" ] || return 1
+        temporary=$(umask 077; mktemp "$STATE_DIR/.direct.XXXXXXXX") || return 1
+        printf '%s\n%s\n\n' "$pid" "$current" > "$temporary"
+        chmod 600 "$temporary" && mv -f "$temporary" "$file" || return 1
+        stop_direct_process "$label" || true
+    fi
+    err "direct mount failed; private diagnostic log: $log"
+    return 1
+}
+setup_relays() {
+    local n=0 host path seen=, result=0 found=0
+    ensure_tailscale || true
+    while [ "$n" -lt "${#LABELS[@]}" ]; do
+        if [ "${GROUPS_CFG[$n]}" = perception ] && selected perception; then
+            found=1; path=${REMOTES[$n]}
+            IFS=, read -r -a candidates <<< "${ALIASES[$n]}"
+            for host in "${candidates[@]}"; do
+                case "$seen" in *",$host,"*) continue ;; esac
+                seen="$seen$host,"
+                prepare_relay "$host" "$path" yes || { err "setup failed: $host"; result=1; }
+            done
+        fi
+        n=$((n + 1))
+    done
+    [ "$found" -eq 1 ] || { err 'no perception relays selected'; return 1; }
+    return "$result"
+}
+do_passwd() {
+    local password confirmation obscured directory temporary lock host n=0 seen=, result=0
+    PASSWORD_UPDATED=no
+    if [ "$DRY_RUN" -eq 1 ]; then printf 'Would read a hidden password, atomically update only [%s], and synchronize/reload configured relays. No password is requested.\n' "$SMB_REMOTE"; setup_relays; return $?; fi
+    find_rclone && check_rclone_config || return 1
+    extract_smb_block >/dev/null || { err 'selected rclone SMB block is invalid'; return 1; }
+    printf 'New stored SMB password: ' >&2; IFS= read -r -s password || return 1; printf '\n' >&2
+    printf 'Confirm stored SMB password: ' >&2; IFS= read -r -s confirmation || { unset password; return 1; }; printf '\n' >&2
+    [ -n "$password" ] && [ "$password" = "$confirmation" ] || { unset password confirmation; err 'passwords do not match or are empty'; return 1; }
+    obscured=$(printf '%s' "$password" | rclone_run obscure - 2>/dev/null) || { unset password confirmation; return 1; }
+    unset password confirmation
+    [ -n "$obscured" ] || { err 'rclone did not obscure password'; return 1; }
+    directory=$(dirname -- "$RCLONE_CONFIG"); lock="$directory/.mownt-password-lock"
+    ( umask 077; mkdir "$lock" ) || { unset obscured; err 'another password update is active'; return 1; }
+    temporary=$(umask 077; mktemp "$directory/.mownt.XXXXXXXX") || { unset obscured; rmdir "$lock"; return 1; }
+    # The credential travels through stdin, never a subprocess argument.
+    if ! printf '%s\n' "$obscured" | awk -v name="$SMB_REMOTE" '
+        FILENAME=="-" {password=$0; next}
+        /^[[:space:]]*\[/ {if (active && !written) print "pass = " password; header=$0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", header); active=(header=="[" name "]"); if(active) written=0}
+        active && /^[[:space:]]*pass[[:space:]]*=/ {if(!written) print "pass = " password; written=1; next}
+        {print}
+        END {if(active && !written) print "pass = " password}
+    ' - "$RCLONE_CONFIG" > "$temporary"; then unset obscured; rm -f "$temporary"; rmdir "$lock"; return 1; fi
+    unset obscured
+    if ! chmod 600 "$temporary" || ! mv -f "$temporary" "$RCLONE_CONFIG"; then rm -f "$temporary"; rmdir "$lock"; return 1; fi
+    rmdir "$lock" || return 1
+    PASSWORD_UPDATED=yes
+    printf 'Stored local SMB credential updated.\n'
+    ensure_tailscale || true
+    while [ "$n" -lt "${#LABELS[@]}" ]; do
+        if [ "${GROUPS_CFG[$n]}" = perception ] && selected perception; then
+            IFS=, read -r -a candidates <<< "${ALIASES[$n]}"
+            for host in "${candidates[@]}"; do
+                case "$seen" in *",$host,"*) continue ;; esac
+                seen="$seen$host,"
+                if ensure_master "$host" perception && ensure_relay_helper "$host" && relay_call "$host" setup "${REMOTES[$n]}" && extract_smb_block | relay_call "$host" sync "${REMOTES[$n]}" && relay_call "$host" reload "${REMOTES[$n]}"; then
+                    printf 'Updated stored credential on %s.\n' "$host"
+                else err "credential sync failed: $host (retry with -setup)"; result=1; fi
+            done
+        fi
+        n=$((n + 1))
+    done
+    # Repair local clients so cached direct credentials and relay sockets refresh.
+    n=0
+    while [ "$n" -lt "${#LABELS[@]}" ]; do
+        if [ "${GROUPS_CFG[$n]}" = perception ] && selected perception; then
+            refresh_mounts || return 1
+            if [ -n "$(source_at "${LOCALS[$n]}")" ]; then
+                unmount_entry "${LABELS[$n]}" "${LOCALS[$n]}" "${ALIASES[$n]}" "${REMOTES[$n]}" || result=1
+            fi
+        fi
+        n=$((n + 1))
+    done
+    # The normal mount loop below remounts perception after this function.
+    return "$result"
 }
 refresh_mounts || exit 1
+has_perception=no
+i=0
+while [ "$i" -lt "${#LABELS[@]}" ]; do
+    if [ "${GROUPS_CFG[$i]}" = perception ] && selected perception; then has_perception=yes; fi
+    i=$((i + 1))
+done
+# Serialize local mutating transactions, including credential changes and sync.
+if [ "$DRY_RUN" -eq 0 ] && [ "$ACTION" != doctor ] && [ "$ACTION" != status ]; then
+    ensure_state || exit 1
+    OPERATION_LOCK="$STATE_DIR/.operation-lock"
+    ( umask 077; mkdir "$OPERATION_LOCK" ) || { err 'another local operation is running; inspect the private operation lock if a prior run was interrupted'; exit 1; }
+    trap 'rmdir "$OPERATION_LOCK" 2>/dev/null || true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+fi
 if [ "$ACTION" = doctor ]; then
-    result=0
+    result=0; matched=0
     for dependency in ssh sshfs mount stat awk umount; do need "$dependency" || result=1; done
+    if [ "$AUTO_PROVISION" = yes ] && { [ ! -f "$RELAY_HELPER" ] || [ -L "$RELAY_HELPER" ]; }; then err 'packaged relay helper missing'; result=1; fi
     i=0
     while [ "$i" -lt "${#LABELS[@]}" ]; do
         if selected "${GROUPS_CFG[$i]}"; then
-            source=$(source_at "${LOCALS[$i]}")
+            matched=$((matched + 1)); source=$(source_at "${LOCALS[$i]}")
             if [ -n "$source" ]; then
-                { expected_source "$source" "${ALIASES[$i]}" "${REMOTES[$i]}" && sshfs_at "${LOCALS[$i]}"; } || { err "${LABELS[$i]} has a foreign mount"; result=1; }
+                owned_mount "${LABELS[$i]}" "${LOCALS[$i]}" "${ALIASES[$i]}" "${REMOTES[$i]}" || { err "${LABELS[$i]} has a foreign mount"; result=1; }
             else check_local_path "${LOCALS[$i]}" || result=1; fi
         fi
         i=$((i + 1))
     done
-    [ "$result" -ne 0 ] || printf 'Local checks passed. Verify host keys and SSH authentication before mounting.\n'
+    [ "$matched" -gt 0 ] || { err 'no entries match selected groups'; result=1; }
+    if [ "$has_perception" = yes ] && [ "$AUTO_PROVISION" = yes ]; then
+        extract_smb_block >/dev/null || { err 'selected private SMB configuration is missing or invalid'; result=1; }
+    fi
+    [ "$result" -ne 0 ] || printf 'Local checks passed. Network and remote provisioning were not contacted.\n'
     exit "$result"
 fi
-if [ "$ACTION" = up ]; then need sshfs && need ssh || exit 1; fi
-result=0; matched=0; i=0
+if [ "$ACTION" = setup ]; then setup_relays; exit $?; fi
+result=0
+if [ "$ACTION" = passwd ]; then
+    do_passwd || result=1
+    [ "$DRY_RUN" -eq 0 ] || exit "$result"
+    [ "$PASSWORD_UPDATED" = yes ] || exit 1
+    ACTION=up; GROUPS_SELECTED=(perception)
+fi
+if [ "$ACTION" = up ]; then
+    need sshfs && need ssh || exit 1
+    if [ "$has_perception" = yes ]; then ensure_tailscale || true; fi
+fi
+mount_one() {
+    local index=$1 label mp remote aliases source group mounted=0 alias mode stale_dry=no
+    label=${LABELS[$index]}; mp=${LOCALS[$index]}; remote=${REMOTES[$index]}; aliases=${ALIASES[$index]}; group=${GROUPS_CFG[$index]}; mode=${MODES[$index]}
+    refresh_mounts || return 1
+    source=$(source_at "$mp")
+    if [ -n "$source" ]; then
+        owned_mount "$label" "$mp" "$aliases" "$remote" || { err "$label: foreign mount at $mp; refusing to operate"; return 1; }
+        if [ "$DRY_RUN" -eq 1 ]; then printf '%s is mounted; would check health and recover this expected mount if stale (health not probed).\n' "$label"; return 0; fi
+        if health "$mp"; then printf '%s already mounted\n' "$label"; return 0; fi
+        printf '%s is stale; recovering the configured mount.\n' "$label"
+        unmount_entry "$label" "$mp" "$aliases" "$remote" || return 1
+        [ "$DRY_RUN" -eq 0 ] || stale_dry=yes
+    fi
+    if [ "$stale_dry" = no ]; then check_local_path "$mp" || return 1; fi
+    IFS=, read -r -a candidates <<< "$aliases"
+    for alias in "${candidates[@]}"; do
+        if [ "$group" = perception ]; then
+            prepare_relay "$alias" "$remote" || { err "$label: relay $alias unavailable"; continue; }
+        else ensure_master "$alias" "$group" || { err "$label: SSH login failed for $alias"; continue; }; fi
+        ssh_args_for "$alias"
+        command=(sshfs "$alias:$remote" "$mp" "${SSH_ARGS[@]}" -o reconnect -o 'nosuid,nodev,idmap=user' -o "$mode")
+        if [ "$DRY_RUN" -eq 1 ]; then
+            printf '%s candidate %s\n' "$label" "$alias"; print_command "${command[@]}"; mounted=1; continue
+        fi
+        ( umask 077; mkdir -p "$mp" ) || break
+        if "${command[@]}"; then
+            refresh_mounts || break
+            source=$(source_at "$mp")
+            if expected_source "$source" "$aliases" "$remote" && sshfs_at "$mp" && health "$mp"; then
+                printf '%s mounted at %s\n' "$label" "$mp"; return 0
+            fi
+            err "$label: mount health failed; recovering expected mount before failover"
+        fi
+        refresh_mounts || break
+        if [ -n "$(source_at "$mp")" ]; then
+            unmount_entry "$label" "$mp" "$aliases" "$remote" || return 1
+        fi
+        err "$label: candidate $alias failed"
+    done
+    if [ "$group" = perception ] && [ "$DIRECT_FALLBACK" = yes ]; then
+        if mount_direct "$label" "$mp" "$mode"; then return 0; fi
+    fi
+    [ "$DRY_RUN" -eq 0 ] || [ "$mounted" -eq 0 ] || return 0
+    err "$label: mount failed"; return 1
+}
+matched=0; i=0
 while [ "$i" -lt "${#LABELS[@]}" ]; do
     if ! selected "${GROUPS_CFG[$i]}"; then i=$((i + 1)); continue; fi
     matched=$((matched + 1))
     label=${LABELS[$i]}; mp=${LOCALS[$i]}; remote=${REMOTES[$i]}; aliases=${ALIASES[$i]}
-    refresh_mounts || exit 1
-    source=$(source_at "$mp")
-    if [ -n "$source" ] && ! { expected_source "$source" "$aliases" "$remote" && sshfs_at "$mp"; }; then
-        err "$label: foreign mount at $mp; refusing to operate"; result=1
-    elif [ "$ACTION" = status ]; then
-        if [ -z "$source" ]; then printf '%s down %s\n' "$label" "$mp"
-        elif health "$mp"; then printf '%s live %s\n' "$label" "$mp"
-        else printf '%s stale %s\n' "$label" "$mp"; result=1; fi
-    elif [ "$ACTION" = down ]; then
-        if [ -z "$source" ]; then printf '%s already down\n' "$label"
-        elif ! unmount_entry "$mp"; then err "$label: unmount failed"; result=1; fi
-    elif [ -n "$source" ]; then
-        if health "$mp"; then printf '%s already mounted\n' "$label"
-        else err "$label: stale mount; use down first (add --force only when needed)"; result=1; fi
-    elif ! check_local_path "$mp"; then result=1
+    if [ "$ACTION" = up ]; then mount_one "$i" || result=1
     else
-        mounted=0
-        IFS=, read -r -a candidates <<< "$aliases"
-        for alias in "${candidates[@]}"; do
-            if [ "${GROUPS_CFG[$i]}" = perception ]; then
-                case "$remote" in
-                    /*) guard_command="mountpoint -q -- '$remote'" ;;
-                    *) # Expand HOME only on the authenticated remote host.
-                       # shellcheck disable=SC2016
-                       guard_command='mountpoint -q -- "$HOME"/'
-                       guard_command="${guard_command}'$remote'" ;;
-                esac
-                guard=(ssh "${SSH_OPTIONS[@]}" -o BatchMode=yes "$alias" "$guard_command")
-                if [ "$DRY_RUN" -eq 1 ]; then print_command "${guard[@]}"
-                elif ! run_timeout 15 "${guard[@]}"; then err "$label: relay $alias mountpoint unavailable"; continue; fi
-            fi
-            command=(sshfs "$alias:$remote" "$mp" "${SSH_OPTIONS[@]}" -o 'nosuid,nodev,default_permissions,idmap=user' -o "${MODES[$i]}")
-            if [ "$DRY_RUN" -eq 1 ]; then
-                printf '%s candidate %s\n' "$label" "$alias"; print_command "${command[@]}"; mounted=1
-                continue
-            fi
-            ( umask 077; mkdir -p "$mp" ) || break
-            if "${command[@]}"; then
-                refresh_mounts || break
-                source=$(source_at "$mp")
-                if expected_source "$source" "$aliases" "$remote" && sshfs_at "$mp" && health "$mp"; then
-                    printf '%s mounted at %s\n' "$label" "$mp"; mounted=1; break
-                fi
-                err "$label: mount command succeeded but health check failed; inspect status and unmount manually"
-                break
-            fi
-            refresh_mounts || break
-            if [ -n "$(source_at "$mp")" ]; then err "$label: failed command left a mount; unmount manually"; break; fi
-            err "$label: candidate $alias failed"
-        done
-        [ "$mounted" -eq 1 ] || { err "$label: mount failed"; result=1; }
+        refresh_mounts || exit 1
+        source=$(source_at "$mp")
+        if [ -n "$source" ] && ! owned_mount "$label" "$mp" "$aliases" "$remote"; then
+            err "$label: foreign mount at $mp; refusing to operate"; result=1
+        elif [ "$ACTION" = status ]; then
+            if [ -z "$source" ]; then printf '%s down %s\n' "$label" "$mp"
+            elif [ "$DRY_RUN" -eq 1 ]; then printf '%s mounted, health not probed %s\n' "$label" "$mp"
+            elif health "$mp"; then printf '%s live %s\n' "$label" "$mp"
+            else printf '%s stale %s\n' "$label" "$mp"; result=1; fi
+        elif [ "$ACTION" = down ]; then
+            if [ -z "$source" ]; then printf '%s already down\n' "$label"; [ "$DRY_RUN" -eq 1 ] || stop_direct_process "$label"
+            elif ! unmount_entry "$label" "$mp" "$aliases" "$remote"; then err "$label: unmount failed"; result=1; fi
+        fi
     fi
     i=$((i + 1))
 done

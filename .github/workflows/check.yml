@@ -30,10 +30,13 @@ jobs:
       - name: Check syntax and lint
         shell: bash
         run: |
-          for script in bin/mownt install.sh tests/run.sh; do
+          for script in bin/mownt install.sh libexec/mownt-relay tools/*.sh tests/*.sh; do
             /bin/bash -n "$script"
           done
-          shellcheck --shell=bash bin/mownt install.sh tests/run.sh
+          shellcheck --shell=bash bin/mownt install.sh libexec/mownt-relay tools/*.sh tests/*.sh
       - name: Run isolated command tests
         shell: bash
-        run: /bin/bash tests/run.sh
+        run: |
+          /bin/bash tests/run.sh
+          /bin/bash tests/relay.sh
+          /bin/bash tests/import-legacy.sh

@@ -1,0 +1,330 @@
+#!/bin/bash
+# Copyright J.C. Vaught. See LICENSE.
+# mownt managed relay helper. Version 1.1.0.
+# Self-contained Linux relay helper. No credential is accepted on the command line.
+set +x
+set -o pipefail
+umask 077
+VERSION=1.1.0
+RCLONE_VERSION=1.75.2
+PATH=/usr/local/bin:/usr/bin:/bin
+export PATH
+LC_ALL=C
+export LC_ALL
+LOCKED=0
+TEMP=
+err() { printf 'mownt-relay: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+cleanup() {
+    [ -z "$TEMP" ] || rm -rf -- "$TEMP"
+    [ "$LOCKED" -eq 0 ] || rmdir -- "$CONFIG_DIR/.mownt-lock" 2>/dev/null
+    :
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+[ "$#" -ne 1 ] || [ "$1" != --version ] || { printf 'mownt-relay %s\n' "$VERSION"; exit 0; }
+[ "$#" -eq 4 ] || die 'usage: mownt-relay check|setup|mount|reload|sync REMOTE SHARE MOUNT_PATH'
+ACTION=$1 REMOTE=$2 SHARE=$3 MOUNT_PATH=$4
+case "$ACTION" in check|setup|mount|reload|sync) ;; *) die 'unsupported action' ;; esac
+[ "$(uname -s)" = Linux ] || die 'relay helper requires Linux'
+UID_NOW=$(id -u)
+[ "$UID_NOW" -ne 0 ] || die 'run as the relay account, without elevated privileges'
+[[ "$REMOTE" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || die 'invalid remote name'
+safe_path() {
+    [ -n "$1" ] || return 1
+    case "$1" in *[!A-Za-z0-9_./-]*|*'//'*|*/|-*) return 1 ;; esac
+    case "/$1/" in */../*|*/./*) return 1 ;; esac
+}
+safe_path "$SHARE" || die 'invalid share path'
+case "$SHARE" in /*) die 'share must be relative to the remote' ;; esac
+safe_path "$HOME" || die 'invalid HOME'
+case "$HOME" in /*) ;; *) die 'HOME must be absolute' ;; esac
+case "$MOUNT_PATH" in \~/*) MOUNT_PATH=${MOUNT_PATH#\~/} ;; esac
+safe_path "$MOUNT_PATH" || die 'invalid mount path'
+case "$MOUNT_PATH" in /*) ;; *) MOUNT_PATH="$HOME/$MOUNT_PATH" ;; esac
+case "$MOUNT_PATH" in "$HOME"/*) ;; *) die 'mount path must be below HOME' ;; esac
+CONFIG_DIR="$HOME/.config/rclone"
+CONFIG="$CONFIG_DIR/rclone.conf"
+CACHE="$HOME/.cache/mownt/rclone"
+SOURCE="$REMOTE:$SHARE"
+
+# Check every existing ancestor, including ancestors above HOME. Root ownership
+# is accepted above HOME; directories beneath HOME must belong to this account.
+safe_directory() {
+    local create=$2 cursor='' remainder=${1#/} component metadata owner mode
+    while [ -n "$remainder" ]; do
+        component=${remainder%%/*}
+        if [ "$component" = "$remainder" ]; then remainder=; else remainder=${remainder#*/}; fi
+        cursor="$cursor/$component"
+        [ ! -L "$cursor" ] || { err 'symlink directory refused'; return 1; }
+        if [ ! -e "$cursor" ]; then
+            [ "$create" = yes ] || return 1
+            mkdir -m 700 -- "$cursor" || return 1
+        fi
+        [ -d "$cursor" ] || return 1
+        metadata=$(stat -c '%u %a' -- "$cursor") || return 1
+        read -r owner mode <<< "$metadata"
+        case "$cursor" in "$HOME"|"$HOME"/*) [ "$owner" = "$UID_NOW" ] || return 1 ;;
+            *) [ "$owner" = 0 ] || [ "$owner" = "$UID_NOW" ] || return 1 ;; esac
+        if [ "$((8#$mode & 8#022))" -ne 0 ]; then
+            # Root-owned sticky ancestors protect each existing child from
+            # replacement, allowing private test and login homes below /tmp.
+            case "$cursor" in "$HOME"|"$HOME"/*) err 'writable directory refused'; return 1 ;; esac
+            if [ "$owner" != 0 ] || [ "$((8#$mode & 8#1000))" -eq 0 ]; then
+                err 'writable directory refused'; return 1
+            fi
+        fi
+    done
+}
+private_file() {
+    local data owner mode links
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    data=$(stat -c '%u %a %h' -- "$1") || return 1
+    read -r owner mode links <<< "$data"
+    [ "$owner" = "$UID_NOW" ] && [ "$mode" = 600 ] && [ "$links" = 1 ]
+}
+safe_directory "$HOME" no || die 'unsafe HOME directory ancestry'
+
+# Only these data options can cross to another account. Executable credential
+# helpers, includes, alternate backends, and all unknown options are rejected.
+validate_block() {
+    # Some awk implementations silently discard NUL bytes before matching.
+    # cmp reads the same file; neither pipeline process writes to it.
+    # shellcheck disable=SC2094
+    tr -d '\000' < "$1" | cmp -s - "$1" || return 1
+    awk -v remote="$REMOTE" '
+        function trim(s) {sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s}
+        {clean=$0; gsub(/\t/, "", clean); if (length($0)>8192 || clean ~ /[[:cntrl:]]/) exit 1}
+        /^[ \t]*($|[#;])/ {next}
+        /^[ \t]*\[/ {if (trim($0)!="[" remote "]" || sections++) exit 1; next}
+        {
+            if (!sections) exit 1
+            n=index($0,"="); if (!n) exit 1
+            key=trim(substr($0,1,n-1)); value=trim(substr($0,n+1))
+            if (key !~ /^(type|host|user|pass|domain|port|spn|idle_timeout|hide_special_share|case_insensitive|encoding|description|use_kerberos)$/ || seen[key]++) exit 1
+            if (key=="type" && value!="smb") exit 1
+            if (key=="use_kerberos" && value!="false") exit 1
+            if (key=="host" && value !~ /^[A-Za-z0-9][A-Za-z0-9_.-]*$/) exit 1
+            if (key=="port" && (value !~ /^[0-9]+$/ || value<1 || value>65535)) exit 1
+            if (key ~ /^(hide_special_share|case_insensitive)$/ && value!="true" && value!="false") exit 1
+            if (key=="idle_timeout" && value !~ /^[0-9]+([.][0-9]+)?(ms|s|m|h)$/) exit 1
+            if (key=="encoding" && value !~ /^[A-Za-z0-9,]+$/) exit 1
+        }
+        END {if (sections!=1 || !seen["type"] || !seen["host"]) exit 1}
+    ' "$1"
+}
+new_temp() {
+    [ -n "$TEMP" ] || TEMP=$(mktemp -d "$CONFIG_DIR/.mownt-tmp.XXXXXXXX") || die 'cannot create private temporary directory'
+}
+selected_block() {
+    private_file "$CONFIG" || return 1
+    new_temp
+    awk -v remote="$REMOTE" '
+        /^[ \t]*\[/ {s=$0; sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); active=(s=="[" remote "]")}
+        active {print}
+    ' "$CONFIG" > "$TEMP/selected" || return 1
+    validate_block "$TEMP/selected"
+}
+find_rclone() {
+    local candidate
+    RCLONE=
+    for candidate in "$HOME/.local/bin/rclone" "$HOME/bin/rclone"; do
+        if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then continue; fi
+        safe_directory "${candidate%/*}" no || return 1
+        [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ] || return 1
+        local data owner mode
+        data=$(stat -c '%u %a' -- "$candidate") || return 1
+        read -r owner mode <<< "$data"
+        [ "$owner" = "$UID_NOW" ] && [ "$((8#$mode & 8#022))" -eq 0 ] || return 1
+        RCLONE=$candidate; return 0
+    done
+    for candidate in /usr/local/bin/rclone /usr/bin/rclone /bin/rclone; do
+        [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ] || continue
+        safe_directory "${candidate%/*}" no || continue
+        data=$(stat -c '%u %a' -- "$candidate") || continue
+        read -r owner mode <<< "$data"
+        [ "$owner" = 0 ] || [ "$owner" = "$UID_NOW" ] || continue
+        [ "$((8#$mode & 8#022))" -eq 0 ] || continue
+        RCLONE=$candidate; return 0
+    done
+    return 1
+}
+run_rclone() {
+    env -i HOME="$HOME" PATH="$PATH" LANG=C "$RCLONE" --config "$CONFIG" "$@"
+}
+install_rclone() {
+    local arch expected archive member actual
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64; expected=349ac8fba6ff65d6247043f1750cdcb518ec5d500ef91463a10d37c0ccdf3702 ;;
+        aarch64|arm64) arch=arm64; expected=7e1e8d69654941b7b7df84ee74c5f7fb09cce7d5496947fb7bf16b55ff427d10 ;;
+        *) die 'automatic rclone installation supports Linux amd64 and arm64' ;;
+    esac
+    if ! command -v curl >/dev/null || ! command -v sha256sum >/dev/null || ! command -v unzip >/dev/null; then
+        die 'install curl, sha256sum and unzip first'
+    fi
+    safe_directory "$HOME/.local/bin" yes || die 'unsafe executable directory'
+    if [ -e "$HOME/.local/bin/rclone" ] || [ -L "$HOME/.local/bin/rclone" ]; then
+        die 'rclone installation target already exists but failed executable safety checks'
+    fi
+    new_temp
+    archive="rclone-v$RCLONE_VERSION-linux-$arch.zip"
+    member="rclone-v$RCLONE_VERSION-linux-$arch/rclone"
+    curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error --location --max-time 60 --max-filesize 104857600 \
+        "https://downloads.rclone.org/v$RCLONE_VERSION/$archive" -o "$TEMP/archive.zip" || die 'rclone download failed'
+    actual=$(sha256sum "$TEMP/archive.zip") || die 'cannot verify archive'
+    [ "${actual%% *}" = "$expected" ] || die 'rclone archive checksum mismatch'
+    unzip -p "$TEMP/archive.zip" "$member" > "$TEMP/rclone" || die 'cannot read verified executable'
+    [ -s "$TEMP/rclone" ] || die 'verified archive executable is empty'
+    chmod 700 "$TEMP/rclone" || die 'cannot secure executable'
+    # Keep installation atomic even when .config and .local are separate devices.
+    local stage
+    stage=$(mktemp "$HOME/.local/bin/.mownt-rclone.XXXXXXXX") || die 'cannot stage executable'
+    if ! cp -- "$TEMP/rclone" "$stage" || ! chmod 700 "$stage" || ! mv -f -- "$stage" "$HOME/.local/bin/rclone"; then
+        rm -f -- "$stage"; die 'cannot install rclone'
+    fi
+    find_rclone || die 'installed rclone failed executable checks'
+}
+mount_record() {
+    awk -v path="$MOUNT_PATH" '$2==path {print $1 " " $3 " " $4; exit}' /proc/self/mounts
+}
+expected_mount() {
+    local record source type options
+    record=$(mount_record) || return 1
+    read -r source type options <<< "$record"
+    [ "$source" = "$SOURCE" ] && [ "$type" = fuse.rclone ] || return 1
+    case ",$options," in *",user_id=$UID_NOW,"*) return 0 ;; esac
+    return 1
+}
+healthy() {
+    command -v timeout >/dev/null || return 1
+    timeout --signal=KILL 5 stat -- "$MOUNT_PATH" >/dev/null 2>&1 && \
+        timeout --signal=KILL 5 ls -A -- "$MOUNT_PATH" >/dev/null 2>&1
+}
+# A lazily detached FUSE mount can leave its daemon alive. Sharing its VFS
+# cache with a replacement daemon risks data corruption, so inspect exact
+# NUL-delimited arguments before reusing the fixed cache. This refusal-only
+# check covers alternate binaries and wrappers without signalling any process.
+cache_user_active() {
+    local deadline=$1 process owner argument previous matched
+    for process in /proc/[0-9]*; do
+        [ "$SECONDS" -lt "$deadline" ] || return 3
+        owner=$(stat -c '%u' -- "$process" 2>/dev/null) || continue
+        [ "$owner" = "$UID_NOW" ] || continue
+        previous=; matched=0
+        if {
+            while IFS= read -r -d '' argument; do
+                case "$argument" in "--cache-dir=$CACHE") matched=1 ;; esac
+                if [ "$previous" = --cache-dir ] && [ "$argument" = "$CACHE" ]; then matched=1; fi
+                previous=$argument
+            done < "$process/cmdline"
+        } 2>/dev/null; then
+            :
+        else
+            # An exited process is harmless; a live unreadable one cannot be
+            # excluded as a cache owner and therefore blocks a fresh mount.
+            [ ! -d "$process" ] || return 2
+            continue
+        fi
+        [ "$matched" -eq 0 ] || return 0
+    done
+    return 1
+}
+wait_cache_unused() {
+    local deadline=$((SECONDS + 12)) result
+    while :; do
+        cache_user_active "$deadline"; result=$?
+        case "$result" in
+            1) return 0 ;;
+            2) die 'cannot inspect an existing account process; cache reuse refused' ;;
+            3) die 'cache ownership check exceeded 12 seconds; cache reuse refused' ;;
+        esac
+        [ "$SECONDS" -lt "$deadline" ] || die 'existing process still uses the rclone cache; retry after it exits'
+        sleep 1
+    done
+}
+mount_now() {
+    local record parent entries
+    record=$(mount_record) || die 'cannot inspect mount table'
+    if [ -n "$record" ]; then expected_mount && healthy && return 0; die 'mountpoint occupied or unhealthy; use reload for the expected mount'; fi
+    # Refuse other mounted ancestors before traversing filesystem metadata.
+    parent=${MOUNT_PATH%/*}
+    while [ "$parent" != "$HOME" ] && [ "$parent" != / ] && [ -n "$parent" ]; do
+        awk -v p="$parent" '$2==p {found=1} END {exit found ? 0 : 1}' /proc/self/mounts && die 'mounted mountpoint ancestor refused'
+        parent=${parent%/*}
+    done
+    safe_directory "$MOUNT_PATH" yes || die 'unsafe mountpoint directory'
+    entries=$(ls -A -- "$MOUNT_PATH") || die 'cannot inspect mountpoint contents'
+    [ -z "$entries" ] || die 'mountpoint must be empty'
+    safe_directory "$CACHE" yes || die 'unsafe rclone cache directory'
+    [ "$(stat -c '%a' -- "$CACHE")" = 700 ] || die 'rclone cache directory must have mode 700'
+    wait_cache_unused
+    run_rclone mount "$SOURCE" "$MOUNT_PATH" --devname "$SOURCE" --cache-dir "$CACHE" \
+        --vfs-cache-mode full --vfs-cache-max-size 20G --dir-cache-time 24h \
+        --daemon --daemon-wait 30s --daemon-timeout 30s --log-level ERROR >/dev/null 2>&1 || die 'rclone mount failed'
+    if ! expected_mount || ! healthy; then die 'backing mount failed identity or health verification'; fi
+}
+
+if [ "$ACTION" = check ]; then
+    safe_directory "$CONFIG_DIR" no || exit 1
+    [ "$(stat -c '%a' -- "$CONFIG_DIR")" = 700 ] || exit 1
+    find_rclone && selected_block && expected_mount && healthy
+    exit $?
+fi
+safe_directory "$CONFIG_DIR" yes || die 'unsafe configuration directory'
+case "$ACTION" in
+    setup|sync) chmod 700 -- "$CONFIG_DIR" || die 'cannot secure rclone configuration directory' ;;
+esac
+[ "$(stat -c '%a' -- "$CONFIG_DIR")" = 700 ] || die 'rclone configuration directory must have mode 700'
+mkdir -m 700 -- "$CONFIG_DIR/.mownt-lock" 2>/dev/null || die 'relay operation already running; inspect stale .mownt-lock manually'
+LOCKED=1
+if [ -e "$CONFIG" ] || [ -L "$CONFIG" ]; then private_file "$CONFIG" || die 'rclone.conf must be a regular private file owned by you'; fi
+case "$ACTION" in
+    setup) find_rclone || install_rclone ;;
+    sync)
+        new_temp
+        # Bounded secret input. Read one byte past the limit to detect overflow.
+        head -c 65537 > "$TEMP/incoming" || die 'cannot read selected configuration'
+        [ "$(wc -c < "$TEMP/incoming")" -le 65536 ] || die 'selected configuration exceeds 64 KiB'
+        validate_block "$TEMP/incoming" || die 'selected configuration rejected; only one supported SMB section is allowed'
+        if [ -f "$CONFIG" ]; then
+            # Reject encrypted files, which must be configured on the relay itself.
+            LC_ALL=C awk '/^RCLONE_ENCRYPT_V[0-9]+:/ {exit 1}' "$CONFIG" || die 'encrypted configuration cannot be merged'
+            awk -v remote="$REMOTE" '
+                /^[ \t]*\[/ {s=$0; sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); skip=(s=="[" remote "]")}
+                !skip {print}
+            ' "$CONFIG" > "$TEMP/merged" || die 'cannot prepare configuration'
+        else : > "$TEMP/merged"; fi
+        printf '\n' >> "$TEMP/merged"
+        cat "$TEMP/incoming" >> "$TEMP/merged" || die 'cannot prepare configuration'
+        printf '\n' >> "$TEMP/merged"
+        # Repeated sync leaves identical selected data and the file inode alone.
+        if [ -f "$CONFIG" ]; then
+            awk -v remote="$REMOTE" '
+                /^[ \t]*\[/ {s=$0; sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); active=(s=="[" remote "]")}
+                active {print}
+            ' "$CONFIG" > "$TEMP/current" || die 'cannot compare selected configuration'
+            awk '/^[ \t]*($|[#;])/ {next} {sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); print}' "$TEMP/current" > "$TEMP/current-data" || die 'cannot compare selected configuration'
+            awk '/^[ \t]*($|[#;])/ {next} {sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); print}' "$TEMP/incoming" > "$TEMP/incoming-data" || die 'cannot compare selected configuration'
+            if cmp -s "$TEMP/current-data" "$TEMP/incoming-data"; then printf 'unchanged\n'; exit 0; fi
+        fi
+        if ! chmod 600 "$TEMP/merged" || ! mv -f -- "$TEMP/merged" "$CONFIG"; then die 'cannot replace configuration'; fi
+        printf 'changed\n'
+        ;;
+    mount|reload)
+        find_rclone || die 'rclone missing; run setup first'
+        selected_block || die 'selected remote missing or unsupported; sync a supported SMB section first'
+        if [ "$ACTION" = reload ] && [ -n "$(mount_record)" ]; then
+            expected_mount || die 'refusing to unmount an unexpected filesystem'
+            if command -v fusermount3 >/dev/null; then UNMOUNTER=fusermount3
+            elif command -v fusermount >/dev/null; then UNMOUNTER=fusermount
+            else die 'fusermount3 or fusermount is required'; fi
+            command -v timeout >/dev/null || die 'timeout is required'
+            timeout --signal=KILL 10 "$UNMOUNTER" -u -- "$MOUNT_PATH" >/dev/null 2>&1 || {
+                expected_mount || die 'mount identity changed while unmounting'
+                timeout --signal=KILL 10 "$UNMOUNTER" -uz -- "$MOUNT_PATH" >/dev/null 2>&1 || die 'backing mount unmount failed'
+            }
+            [ -z "$(mount_record)" ] || die 'backing mount remains active'
+        fi
+        mount_now
+        ;;
+esac
