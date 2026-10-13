@@ -1,0 +1,39 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install shell checker
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install shellcheck
+          else
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y shellcheck
+          fi
+      - name: Check syntax and lint
+        shell: bash
+        run: |
+          for script in bin/mownt install.sh tests/run.sh; do
+            /bin/bash -n "$script"
+          done
+          shellcheck --shell=bash bin/mownt install.sh tests/run.sh
+      - name: Run isolated command tests
+        shell: bash
+        run: /bin/bash tests/run.sh

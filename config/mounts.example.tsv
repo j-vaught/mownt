@@ -1,0 +1,12 @@
+# Six literal-tab-separated fields. Replace every example before use.
+# group label ssh_aliases remote_path local_path mode
+# SSH aliases must already be configured and host keys independently verified.
+# The perception remote path must be an existing active mountpoint on each relay.
+# Relative paths and ~/ paths resolve from each relay account's own home.
+# No passwords, tokens, private keys, hostnames, or account identifiers belong here.
+theia	theia-home	theia	/home/example	~/mnt/theia-home	ro
+theia	theia-work	theia	/work/example	~/mnt/theia-work	ro
+delta	delta-home	delta	/home/example	~/mnt/delta-home	ro
+delta	delta-scratch	delta	/scratch/example	~/mnt/delta-scratch	ro
+delta	delta-projects	delta	/projects/example	~/mnt/delta-projects	ro
+perception	perception-share	relay-a,relay-b	~/mnt/share	~/mnt/perception-share	ro

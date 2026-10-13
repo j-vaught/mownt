@@ -1,0 +1,304 @@
+#!/bin/bash
+# Copyright J.C. Vaught. See LICENSE.
+# User-owned SSHFS mounts. Configuration is data, never shell code.
+set -o pipefail
+VERSION=1.0.0
+ACTION=up
+ACTION_SET=0
+DRY_RUN=0
+FORCE=0
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/mownt/mounts.tsv"
+GROUPS_SELECTED=()
+GROUPS_CFG=(); LABELS=(); ALIASES=(); REMOTES=(); LOCALS=(); MODES=()
+SSH_OPTIONS=(-o StrictHostKeyChecking=yes -o ForwardAgent=no -o ForwardX11=no -o ForwardX11Trusted=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+err() { printf 'mownt: %s\n' "$*" >&2; }
+fail_config() { err "$*"; exit 2; }
+usage() {
+    cat <<'HELP'
+Usage: mownt [up|down|status|doctor] [OPTIONS]
+  -t, --theia         Select Theia entries.
+  -d, --delta         Select Delta entries.
+  -p, --perception    Select perception relay entries.
+  -a, --all           Select every configured entry (default).
+  --config FILE      Read a private six-column TSV configuration.
+  --dry-run          Show planned commands without changing files or mounts.
+  --force            Request forced unmount; allowed only with down.
+  -x, --down          Unmount selected entries.
+  -s, --status        Check selected local mounts, with bounded health probes.
+  --doctor           Check local configuration and dependencies, without network.
+  -h, --help         Show help.
+  --version          Print version.
+
+Default configuration: ${XDG_CONFIG_HOME:-$HOME/.config}/mownt/mounts.tsv
+Columns: group<TAB>label<TAB>ssh_aliases<TAB>remote_path<TAB>local_path<TAB>mode
+Configuration directory must be owned by you with mode 700; file mode 600.
+See README.md and docs/setup.md before mounting a new host.
+HELP
+}
+set_action() {
+    [ "$ACTION_SET" -eq 0 ] || [ "$ACTION" = "$1" ] || fail_config 'choose one action'
+    ACTION=$1; ACTION_SET=1
+}
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        up) set_action up ;;
+        down|-x|-down|--down) set_action down ;;
+        status|-s|-status|--status) set_action status ;;
+        doctor|--doctor) set_action doctor ;;
+        -t|-theia|--theia) GROUPS_SELECTED+=(theia) ;;
+        -d|-delta|--delta) GROUPS_SELECTED+=(delta) ;;
+        -p|-perception|--perception) GROUPS_SELECTED+=(perception) ;;
+        -a|-all|--all) GROUPS_SELECTED+=(all) ;;
+        --config) shift; [ "$#" -gt 0 ] || fail_config '--config needs a filename'; CONFIG=$1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        --force) FORCE=1 ;;
+        -h|-help|--help|help) usage; exit 0 ;;
+        --version) printf 'mownt %s\n' "$VERSION"; exit 0 ;;
+        setup|-setup|--setup|passwd|-pw|-passwd|--passwd)
+            err 'Provision relays and rotate credentials manually. See docs/setup.md; automatic credential copying is intentionally unavailable.'; exit 2 ;;
+        *) fail_config "unknown argument: $1" ;;
+    esac
+    shift
+done
+[ "$FORCE" -eq 0 ] || [ "$ACTION" = down ] || fail_config '--force is only valid with down'
+[ "$(id -u)" -ne 0 ] || fail_config 'run as your normal account, without elevated privileges'
+[ -n "$HOME" ] && [ "${HOME#/}" != "$HOME" ] && [ "$HOME" != / ] || fail_config 'HOME must be an absolute user directory'
+case "$HOME" in *[!A-Za-z0-9_./-]*) fail_config 'HOME contains unsupported characters (spaces are not supported)' ;; esac
+[ -d "$HOME" ] && [ ! -L "$HOME" ] || fail_config 'HOME must be a real directory'
+SYSTEM=$(uname -s)
+case "$SYSTEM" in Darwin|Linux) ;; *) fail_config "unsupported operating system: $SYSTEM" ;; esac
+metadata() {
+    if [ "$SYSTEM" = Darwin ]; then stat -f '%u %Lp' "$1"; else stat -c '%u %a' -- "$1"; fi
+}
+check_private() {
+    local path=$1 expected=$2 data owner mode
+    [ ! -L "$path" ] || fail_config "symlinks are not allowed: $path"
+    data=$(metadata "$path" 2>/dev/null) || fail_config "cannot inspect: $path"
+    read -r owner mode <<< "$data"
+    [ "$owner" = "$(id -u)" ] && [ "$mode" = "$expected" ] || fail_config "$path must be owned by you with mode $expected"
+}
+[ -f "$CONFIG" ] || fail_config "configuration missing: $CONFIG (see config/mounts.example.tsv)"
+CONFIG_DIR=$(dirname -- "$CONFIG")
+case "$CONFIG" in "$HOME"/*) ;; *) fail_config 'configuration must be below HOME' ;; esac
+case "$CONFIG" in *[!A-Za-z0-9_./-]*|*'//'*) fail_config 'unsafe configuration path' ;; esac
+case "/$CONFIG/" in */../*|*/./*) fail_config 'dot components in configuration path' ;; esac
+# Protect the configuration against replacement through an unsafe ancestor.
+cursor=$HOME; remainder=${CONFIG_DIR#"$HOME"/}
+[ "$CONFIG_DIR" != "$HOME" ] || remainder=
+while :; do
+    [ -d "$cursor" ] && [ ! -L "$cursor" ] || fail_config "unsafe configuration ancestor: $cursor"
+    data=$(metadata "$cursor" 2>/dev/null) || fail_config "cannot inspect: $cursor"
+    read -r owner mode <<< "$data"
+    [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 8#022))" -eq 0 ] || fail_config "unsafe configuration ancestor ownership/permissions: $cursor"
+    [ -n "$remainder" ] || break
+    component=${remainder%%/*}
+    if [ "$remainder" = "$component" ]; then remainder=; else remainder=${remainder#*/}; fi
+    cursor="$cursor/$component"
+done
+check_private "$CONFIG_DIR" 700
+check_private "$CONFIG" 600
+safe_path() {
+    local path=$1
+    [ -n "$path" ] || return 1
+    case "$path" in *[!A-Za-z0-9_./~-]*|*'//'*) return 1 ;; esac
+    case "/$path/" in */../*|*/./*) return 1 ;; esac
+    case "$path" in \~/*) path=${path#\~/} ;; *'~'*) return 1 ;; esac
+    [ -n "$path" ] && [ "$path" != / ] && [ "${path%/}" = "$path" ]
+}
+valid_alias() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; }
+line_no=0
+while IFS= read -r line || [ -n "$line" ]; do
+    line_no=$((line_no + 1))
+    case "$line" in ''|'#'*) continue ;; esac
+    count=1; rest=$line
+    while [[ "$rest" == *$'\t'* ]]; do rest=${rest#*$'\t'}; count=$((count + 1)); done
+    [ "$count" -eq 6 ] || fail_config "line $line_no: expected exactly six tab-separated fields"
+    IFS=$'\t' read -r group label aliases remote local_path mode <<< "$line"
+    case "$group" in theia|delta|perception) ;; *) fail_config "line $line_no: invalid group" ;; esac
+    [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail_config "line $line_no: invalid label"
+    case "$aliases" in ''|,*|*,|*,,*) fail_config "line $line_no: invalid SSH aliases" ;; esac
+    IFS=, read -r -a candidates <<< "$aliases"
+    for alias in "${candidates[@]}"; do valid_alias "$alias" || fail_config "line $line_no: invalid SSH alias"; done
+    safe_path "$remote" || fail_config "line $line_no: unsafe remote path"
+    case "$remote" in -*) fail_config "line $line_no: option-like remote path" ;; esac
+    if [ "$group" = perception ]; then
+        # SFTP relative paths resolve inside each relay account's own HOME.
+        # Normalize the optional home shorthand without local expansion.
+        case "$remote" in \~/*) remote=${remote#\~/} ;; esac
+    fi
+    safe_path "$local_path" || fail_config "line $line_no: unsafe local path"
+    case "$local_path" in \~/*) local_path="$HOME/${local_path#\~/}" ;; esac
+    case "$local_path" in "$HOME"/*) ;; *) fail_config "line $line_no: local path must be below HOME" ;; esac
+    case "$mode" in rw|ro) ;; *) fail_config "line $line_no: mode must be rw or ro" ;; esac
+    i=0
+    while [ "$i" -lt "${#LABELS[@]}" ]; do
+        [ "$label" != "${LABELS[$i]}" ] || fail_config "line $line_no: duplicate label"
+        case "$local_path/" in "${LOCALS[$i]}/"*) fail_config "line $line_no: duplicate or nested mountpoint" ;; esac
+        case "${LOCALS[$i]}/" in "$local_path/"*) fail_config "line $line_no: nested mountpoint" ;; esac
+        i=$((i + 1))
+    done
+    GROUPS_CFG+=("$group"); LABELS+=("$label"); ALIASES+=("$aliases"); REMOTES+=("$remote"); LOCALS+=("$local_path"); MODES+=("$mode")
+done < "$CONFIG"
+[ "${#LABELS[@]}" -gt 0 ] || fail_config 'configuration has no mount entries'
+selected() {
+    [ "${#GROUPS_SELECTED[@]}" -gt 0 ] || return 0
+    local group
+    for group in "${GROUPS_SELECTED[@]}"; do [ "$group" = all ] || [ "$group" = "$1" ] && return 0; done
+    return 1
+}
+print_command() { printf '  '; printf '%q ' "$@"; printf '\n'; }
+need() { command -v "$1" >/dev/null 2>&1 || { err "required command missing: $1"; return 1; }; }
+# Read mount table once before path traversal. Refresh before each mutation.
+refresh_mounts() { MOUNT_TABLE=$(mount) || { err 'cannot read the mount table'; return 1; }; }
+source_at() { printf '%s\n' "$MOUNT_TABLE" | awk -v p="$1" '$2 == "on" && $3 == p {print $1; exit}'; }
+sshfs_at() {
+    printf '%s\n' "$MOUNT_TABLE" | awk -v p="$1" '
+        $2 == "on" && $3 == p && ($0 ~ / type fuse\.sshfs / || $0 ~ /\((macfuse|osxfuse|fusefs)[,)]/) {found=1}
+        END {exit !found}'
+}
+expected_source() {
+    local source=$1 aliases=$2 remote=$3 alias
+    local candidates=()
+    IFS=, read -r -a candidates <<< "$aliases"
+    for alias in "${candidates[@]}"; do [ "$source" = "$alias:$remote" ] && return 0; done
+    return 1
+}
+# No process-group killing or broad process-name matching.
+run_timeout() {
+    local seconds=$1 pid elapsed=0 rc
+    shift
+    "$@" & pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$seconds" ]; then
+            kill -TERM "$pid" 2>/dev/null
+            kill -KILL "$pid" 2>/dev/null
+            # Do not wait on a kernel-stalled filesystem operation.
+            return 124
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$pid" 2>/dev/null; rc=$?
+    return "$rc"
+}
+health() { run_timeout 5 stat "$1" >/dev/null 2>&1; }
+# Every existing directory from HOME down must be owned by the user, without
+# group/world write access. Do not traverse an existing mounted filesystem.
+check_local_path() {
+    local path=$1 cursor=$HOME remainder component data owner mode mounted entries
+    remainder=${path#"$HOME"/}
+    while :; do
+        mounted=$(source_at "$cursor")
+        [ -z "$mounted" ] || { err "refusing to traverse mounted ancestor: $cursor"; return 1; }
+        [ ! -L "$cursor" ] || { err "symlink mount path component: $cursor"; return 1; }
+        if [ -e "$cursor" ]; then
+            [ -d "$cursor" ] || { err "not a directory: $cursor"; return 1; }
+            data=$(metadata "$cursor" 2>/dev/null) || return 1
+            read -r owner mode <<< "$data"
+            [ "$owner" = "$(id -u)" ] && [ "$((8#$mode & 8#022))" -eq 0 ] || { err "unsafe directory ownership/permissions: $cursor"; return 1; }
+        fi
+        [ -n "$remainder" ] || break
+        component=${remainder%%/*}
+        if [ "$remainder" = "$component" ]; then remainder=; else remainder=${remainder#*/}; fi
+        cursor="$cursor/$component"
+    done
+    if [ -d "$path" ]; then
+        entries=$(ls -A "$path" 2>/dev/null) || { err "cannot verify mountpoint contents: $path"; return 1; }
+        [ -z "$entries" ] || { err "mountpoint is not empty: $path"; return 1; }
+    fi
+}
+unmount_entry() {
+    local mp=$1
+    if [ "$SYSTEM" = Darwin ]; then
+        if [ "$FORCE" -eq 1 ]; then command=(diskutil unmount force "$mp"); else command=(diskutil unmount "$mp"); fi
+    elif command -v fusermount3 >/dev/null 2>&1; then
+        if [ "$FORCE" -eq 1 ]; then command=(fusermount3 -uz "$mp"); else command=(fusermount3 -u "$mp"); fi
+    elif command -v fusermount >/dev/null 2>&1; then
+        if [ "$FORCE" -eq 1 ]; then command=(fusermount -uz "$mp"); else command=(fusermount -u "$mp"); fi
+    else
+        if [ "$FORCE" -eq 1 ]; then command=(umount -f "$mp"); else command=(umount "$mp"); fi
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then print_command "${command[@]}"; return 0; fi
+    "${command[@]}" || return 1
+    refresh_mounts || return 1
+    [ -z "$(source_at "$mp")" ] || { err "mount remains attached: $mp"; return 1; }
+}
+refresh_mounts || exit 1
+if [ "$ACTION" = doctor ]; then
+    result=0
+    for dependency in ssh sshfs mount stat awk umount; do need "$dependency" || result=1; done
+    i=0
+    while [ "$i" -lt "${#LABELS[@]}" ]; do
+        if selected "${GROUPS_CFG[$i]}"; then
+            source=$(source_at "${LOCALS[$i]}")
+            if [ -n "$source" ]; then
+                { expected_source "$source" "${ALIASES[$i]}" "${REMOTES[$i]}" && sshfs_at "${LOCALS[$i]}"; } || { err "${LABELS[$i]} has a foreign mount"; result=1; }
+            else check_local_path "${LOCALS[$i]}" || result=1; fi
+        fi
+        i=$((i + 1))
+    done
+    [ "$result" -ne 0 ] || printf 'Local checks passed. Verify host keys and SSH authentication before mounting.\n'
+    exit "$result"
+fi
+if [ "$ACTION" = up ]; then need sshfs && need ssh || exit 1; fi
+result=0; matched=0; i=0
+while [ "$i" -lt "${#LABELS[@]}" ]; do
+    if ! selected "${GROUPS_CFG[$i]}"; then i=$((i + 1)); continue; fi
+    matched=$((matched + 1))
+    label=${LABELS[$i]}; mp=${LOCALS[$i]}; remote=${REMOTES[$i]}; aliases=${ALIASES[$i]}
+    refresh_mounts || exit 1
+    source=$(source_at "$mp")
+    if [ -n "$source" ] && ! { expected_source "$source" "$aliases" "$remote" && sshfs_at "$mp"; }; then
+        err "$label: foreign mount at $mp; refusing to operate"; result=1
+    elif [ "$ACTION" = status ]; then
+        if [ -z "$source" ]; then printf '%s down %s\n' "$label" "$mp"
+        elif health "$mp"; then printf '%s live %s\n' "$label" "$mp"
+        else printf '%s stale %s\n' "$label" "$mp"; result=1; fi
+    elif [ "$ACTION" = down ]; then
+        if [ -z "$source" ]; then printf '%s already down\n' "$label"
+        elif ! unmount_entry "$mp"; then err "$label: unmount failed"; result=1; fi
+    elif [ -n "$source" ]; then
+        if health "$mp"; then printf '%s already mounted\n' "$label"
+        else err "$label: stale mount; use down first (add --force only when needed)"; result=1; fi
+    elif ! check_local_path "$mp"; then result=1
+    else
+        mounted=0
+        IFS=, read -r -a candidates <<< "$aliases"
+        for alias in "${candidates[@]}"; do
+            if [ "${GROUPS_CFG[$i]}" = perception ]; then
+                case "$remote" in
+                    /*) guard_command="mountpoint -q -- '$remote'" ;;
+                    *) # Expand HOME only on the authenticated remote host.
+                       # shellcheck disable=SC2016
+                       guard_command='mountpoint -q -- "$HOME"/'
+                       guard_command="${guard_command}'$remote'" ;;
+                esac
+                guard=(ssh "${SSH_OPTIONS[@]}" -o BatchMode=yes "$alias" "$guard_command")
+                if [ "$DRY_RUN" -eq 1 ]; then print_command "${guard[@]}"
+                elif ! run_timeout 15 "${guard[@]}"; then err "$label: relay $alias mountpoint unavailable"; continue; fi
+            fi
+            command=(sshfs "$alias:$remote" "$mp" "${SSH_OPTIONS[@]}" -o 'nosuid,nodev,default_permissions,idmap=user' -o "${MODES[$i]}")
+            if [ "$DRY_RUN" -eq 1 ]; then
+                printf '%s candidate %s\n' "$label" "$alias"; print_command "${command[@]}"; mounted=1
+                continue
+            fi
+            ( umask 077; mkdir -p "$mp" ) || break
+            if "${command[@]}"; then
+                refresh_mounts || break
+                source=$(source_at "$mp")
+                if expected_source "$source" "$aliases" "$remote" && sshfs_at "$mp" && health "$mp"; then
+                    printf '%s mounted at %s\n' "$label" "$mp"; mounted=1; break
+                fi
+                err "$label: mount command succeeded but health check failed; inspect status and unmount manually"
+                break
+            fi
+            refresh_mounts || break
+            if [ -n "$(source_at "$mp")" ]; then err "$label: failed command left a mount; unmount manually"; break; fi
+            err "$label: candidate $alias failed"
+        done
+        [ "$mounted" -eq 1 ] || { err "$label: mount failed"; result=1; }
+    fi
+    i=$((i + 1))
+done
+[ "$matched" -gt 0 ] || { err 'no entries match selected groups'; result=1; }
+exit "$result"

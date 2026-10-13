@@ -1,0 +1,29 @@
+# Private local configuration and credentials.
+.env
+.env.*
+!.env.example
+mounts.tsv
+config/*.local.tsv
+*.key
+*.pem
+id_rsa*
+id_ed25519*
+rclone.conf
+# Environments and tool caches.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ty_cache/
+node_modules/
+# Build intermediates and platform metadata.
+build/
+dist/
+*.o
+*.a
+*.so
+*.dylib
+*.class
+.DS_Store
