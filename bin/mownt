@@ -405,7 +405,9 @@ extract_smb_block() {
 # Only a nonsecret helper is uploaded. Credentials use a separate stdin channel.
 ensure_relay_helper() {
     local host=$1
-    [ -f "$RELAY_HELPER" ] && [ ! -L "$RELAY_HELPER" ] || { err 'installed relay helper is missing; reinstall mownt'; return 1; }
+    if [ ! -f "$RELAY_HELPER" ] || [ -L "$RELAY_HELPER" ]; then
+        err 'installed relay helper is missing; reinstall mownt'; return 1
+    fi
     ssh_args_for "$host"
     if [ "$DRY_RUN" -eq 1 ]; then printf 'Ensure the shipped helper is current on %s (private atomic upload if needed).\n' "$host"; return 0; fi
     # Validate managed paths on every use. Byte-identical helpers keep their inode.
@@ -644,7 +646,9 @@ do_passwd() {
     extract_smb_block >/dev/null || { err 'selected rclone SMB block is invalid'; return 1; }
     printf 'New stored SMB password: ' >&2; IFS= read -r -s password || return 1; printf '\n' >&2
     printf 'Confirm stored SMB password: ' >&2; IFS= read -r -s confirmation || { unset password; return 1; }; printf '\n' >&2
-    [ -n "$password" ] && [ "$password" = "$confirmation" ] || { unset password confirmation; err 'passwords do not match or are empty'; return 1; }
+    if [ -z "$password" ] || [ "$password" != "$confirmation" ]; then
+        unset password confirmation; err 'passwords do not match or are empty'; return 1
+    fi
     obscured=$(printf '%s' "$password" | rclone_run obscure - 2>/dev/null) || { unset password confirmation; return 1; }
     unset password confirmation
     [ -n "$obscured" ] || { err 'rclone did not obscure password'; return 1; }

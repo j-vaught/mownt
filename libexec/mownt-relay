@@ -139,7 +139,7 @@ find_rclone() {
         RCLONE=$candidate; return 0
     done
     for candidate in /usr/local/bin/rclone /usr/bin/rclone /bin/rclone; do
-        [ -f "$candidate" ] && [ -x "$candidate" ] && [ ! -L "$candidate" ] || continue
+        if [ ! -f "$candidate" ] || [ ! -x "$candidate" ] || [ -L "$candidate" ]; then continue; fi
         safe_directory "${candidate%/*}" no || continue
         data=$(stat -c '%u %a' -- "$candidate") || continue
         read -r owner mode <<< "$data"
